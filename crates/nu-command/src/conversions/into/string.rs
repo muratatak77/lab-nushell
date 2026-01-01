@@ -1,0 +1,423 @@
+use nu_cmd_base::input_handler::{CmdArgument, operate};
+use nu_engine::command_prelude::*;
+use nu_protocol::Config;
+use nu_utils::get_system_locale;
+use num_format::{Grouping, ToFormattedString};
+use std::sync::Arc;
+
+struct Arguments {
+    decimals_value: Option<i64>,
+    cell_paths: Option<Vec<CellPath>>,
+    config: Arc<Config>,
+    group_digits: bool,
+}
+
+impl CmdArgument for Arguments {
+    fn take_cell_paths(&mut self) -> Option<Vec<CellPath>> {
+        self.cell_paths.take()
+    }
+}
+
+#[derive(Clone)]
+pub struct IntoString;
+
+impl Command for IntoString {
+    fn name(&self) -> &str {
+        "into string"
+    }
+
+    fn signature(&self) -> Signature {
+        Signature::build("into string")
+            .input_output_types(vec![
+                (Type::Binary, Type::String),
+                (Type::Int, Type::String),
+                (Type::Number, Type::String),
+                (Type::String, Type::String),
+                (Type::Glob, Type::String),
+                (Type::Bool, Type::String),
+                (Type::Filesize, Type::String),
+                (Type::Date, Type::String),
+                (Type::Duration, Type::String),
+                (Type::CellPath, Type::String),
+                (Type::Range, Type::String),
+                (Type::custom("semver"), Type::String),
+                (Type::custom("semver-range"), Type::String),
+                (
+                    Type::List(Box::new(Type::Any)),
+                    Type::List(Box::new(Type::String)),
+                ),
+                (Type::table(), Type::table()),
+                (Type::record(), Type::record()),
+            ])
+            .allow_variants_without_examples(true) // https://github.com/nushell/nushell/issues/7032
+            .rest(
+                "rest",
+                SyntaxShape::CellPath,
+                "For a data structure input, convert data at the given cell paths.",
+            )
+            .switch(
+                "group-digits",
+                "Group digits together by the locale specific thousands separator.",
+                Some('g'),
+            )
+            .named(
+                "decimals",
+                SyntaxShape::Int,
+                "Decimal digits to which to round.",
+                Some('d'),
+            )
+            .category(Category::Conversions)
+    }
+
+    fn description(&self) -> &str {
+        "Convert value to a string."
+    }
+
+    fn extra_description(&self) -> &str {
+        "Binary input is accepted only to point you to the right command: `into string` does not decode bytes, so it returns an error that suggests `decode`. Use `decode` (for example `decode utf-8`) to turn binary data into a string."
+    }
+
+    fn search_terms(&self) -> Vec<&str> {
+        vec!["convert", "text"]
+    }
+
+    fn run(
+        &self,
+        engine_state: &EngineState,
+        stack: &mut Stack,
+        call: &Call,
+        input: PipelineData,
+    ) -> Result<PipelineData, ShellError> {
+        string_helper(engine_state, stack, call, input)
+    }
+
+    fn examples(&self) -> Vec<Example<'_>> {
+        vec![
+            Example {
+                description: "convert int to string and append three decimal places.",
+                example: "5 | into string --decimals 3",
+                result: Some(Value::test_string("5.000")),
+            },
+            Example {
+                description: "convert float to string and round to nearest integer.",
+                example: "1.7 | into string --decimals 0",
+                result: Some(Value::test_string("2")),
+            },
+            Example {
+                description: "convert float to string.",
+                example: "1.7 | into string --decimals 1",
+                result: Some(Value::test_string("1.7")),
+            },
+            Example {
+                description: "convert float to string and limit to 2 decimals.",
+                example: "1.734 | into string --decimals 2",
+                result: Some(Value::test_string("1.73")),
+            },
+            Example {
+                description: "convert float to string.",
+                example: "4.3 | into string",
+                result: Some(Value::test_string("4.3")),
+            },
+            Example {
+                description: "convert string to string.",
+                example: "'1234' | into string",
+                result: Some(Value::test_string("1234")),
+            },
+            Example {
+                description: "convert boolean to string.",
+                example: "true | into string",
+                result: Some(Value::test_string("true")),
+            },
+            Example {
+                description: "convert date to string.",
+                example: "'2020-10-10 10:00:00 +02:00' | into datetime | into string",
+                result: Some(Value::test_string("Sat Oct 10 10:00:00 2020")),
+            },
+            Example {
+                description: "convert filepath to string.",
+                example: "ls Cargo.toml | get name | into string",
+                result: None,
+            },
+            Example {
+                description: "convert filesize to string.",
+                example: "1kB | into string",
+                result: Some(Value::test_string("1.0 kB")),
+            },
+            Example {
+                description: "convert duration to string.",
+                example: "9day | into string",
+                result: Some(Value::test_string("1wk 2day")),
+            },
+            Example {
+                description: "convert cell-path to string.",
+                example: "$.name | into string",
+                result: Some(Value::test_string("$.name")),
+            },
+            Example {
+                description: "convert semver to string.",
+                example: "'1.2.3' | into semver | into string",
+                result: Some(Value::test_string("1.2.3")),
+            },
+        ]
+    }
+}
+
+fn string_helper(
+    engine_state: &EngineState,
+    stack: &mut Stack,
+    call: &Call,
+    input: PipelineData,
+) -> Result<PipelineData, ShellError> {
+    let head = call.head;
+    let decimals_value: Option<i64> = call.get_flag(engine_state, stack, "decimals")?;
+    let group_digits = call.has_flag(engine_state, stack, "group-digits")?;
+    if let Some(decimal_val) = decimals_value
+        && decimal_val.is_negative()
+    {
+        return Err(ShellError::TypeMismatch {
+            err_message: "Cannot accept negative integers for decimals arguments".to_string(),
+            span: head,
+        });
+    }
+    if let Some(decimal_val) = decimals_value
+        && decimal_val > u16::MAX as i64
+    {
+        return Err(ShellError::IncorrectValue {
+            msg: format!(
+                "Cannot accept more than {} decimal digits for the decimals argument",
+                u16::MAX
+            ),
+            val_span: head,
+            call_span: head,
+        });
+    }
+    let cell_paths = call.rest(engine_state, stack, 0)?;
+    let cell_paths = (!cell_paths.is_empty()).then_some(cell_paths);
+
+    if let PipelineData::ByteStream(stream, metadata) = input {
+        // Just set the type - that should be good enough. There is no guarantee that the data
+        // within a string stream is actually valid UTF-8. But refuse to do it if it was already set
+        // to binary
+        if stream.type_().is_string_coercible() {
+            Ok(PipelineData::byte_stream(
+                stream.with_type(ByteStreamType::String),
+                metadata,
+            ))
+        } else {
+            Err(binary_input_error(stream.span()))
+        }
+    } else {
+        let config = stack.get_config(engine_state);
+        let args = Arguments {
+            decimals_value,
+            cell_paths,
+            config,
+            group_digits,
+        };
+        operate(action, args, input, head, engine_state.signals())
+    }
+}
+
+fn action(input: &Value, args: &Arguments, span: Span) -> Value {
+    let digits = args.decimals_value;
+    let config = &args.config;
+    let group_digits = args.group_digits;
+
+    match input {
+        Value::Int { val, .. } => {
+            let decimal_value = digits.unwrap_or(0) as usize;
+            let res = format_int(*val, group_digits, decimal_value);
+            Value::string(res, span)
+        }
+        Value::Float { val, .. } => {
+            if !val.is_finite() {
+                return Value::string(val.to_string(), span);
+            }
+
+            let basic = match digits {
+                None => val.to_string(),
+                Some(precision) => {
+                    let scale = 10_f64.powi(precision as i32);
+                    let scaled = val * scale;
+                    let rounded = if scaled.is_finite() {
+                        scaled.round() / scale
+                    } else {
+                        *val
+                    };
+                    format!("{:.*}", precision as usize, rounded)
+                }
+            };
+
+            let negative = basic.starts_with('-');
+            let first_digit = if negative { 1 } else { 0 };
+            let decimal = basic.find('.').unwrap_or(basic.len());
+            let decimal_len = decimal - first_digit;
+            let locale = get_system_locale();
+            if !group_digits
+                || match locale.grouping() {
+                    Grouping::Posix => true,
+                    Grouping::Standard | Grouping::Indian => decimal_len < 4,
+                }
+            {
+                let basic = format!(
+                    "{}{}{}{}",
+                    if negative { locale.minus_sign() } else { "" },
+                    &basic[first_digit..decimal],
+                    if decimal < basic.len() {
+                        locale.decimal()
+                    } else {
+                        ""
+                    },
+                    if decimal < basic.len() {
+                        &basic[decimal + 1..]
+                    } else {
+                        ""
+                    }
+                );
+                return Value::string(basic, span);
+            }
+
+            let (size, start, step) = match locale.grouping() {
+                Grouping::Posix => {
+                    unreachable!("Posix locale grouping should already have returned")
+                }
+                Grouping::Standard => (
+                    basic.len() + decimal_len / 3 * locale.separator().len(),
+                    if decimal_len.is_multiple_of(3) {
+                        first_digit + 3
+                    } else {
+                        first_digit + decimal_len % 3
+                    },
+                    3,
+                ),
+                Grouping::Indian => (
+                    basic.len() + ((decimal_len - 3) / 2 + 1) * locale.separator().len(),
+                    if (decimal_len - 3).is_multiple_of(2) {
+                        first_digit + 2
+                    } else {
+                        first_digit + (decimal_len - 3) % 2
+                    },
+                    2,
+                ),
+            };
+            let mut result = String::with_capacity(size);
+            if negative {
+                result.push_str(locale.minus_sign());
+            }
+            result.push_str(&basic[first_digit..start]);
+            for start in (start..(decimal - 3)).step_by(step) {
+                result.push_str(locale.separator());
+                result.push_str(&basic[start..(start + step)])
+            }
+            result.push_str(locale.separator());
+            result.push_str(&basic[(decimal - 3)..decimal]);
+            if decimal < basic.len() {
+                result.push_str(locale.decimal());
+                result.push_str(&basic[decimal + 1..]);
+            }
+            Value::string(result, span)
+        }
+        Value::Bool { val, .. } => Value::string(val.to_string(), span),
+        Value::Date { val, .. } => Value::string(val.format("%c").to_string(), span),
+        Value::String { val, .. } => Value::string(val, span),
+        Value::Glob { val, .. } => Value::string(val, span),
+        Value::CellPath { val, .. } => Value::string(val.to_string(), span),
+        Value::Filesize { val, .. } => {
+            if group_digits {
+                let decimal_value = digits.unwrap_or(0) as usize;
+                Value::string(format_int(val.get(), group_digits, decimal_value), span)
+            } else {
+                Value::string(input.to_expanded_string(", ", config), span)
+            }
+        }
+        Value::Duration { .. } => Value::string(input.to_expanded_string("", config), span),
+        Value::Nothing { .. } => Value::string("".to_string(), span),
+        Value::Record { .. } => Value::error(
+            // Watch out for CantConvert's argument order
+            ShellError::CantConvert {
+                to_type: "string".into(),
+                from_type: "record".into(),
+                span,
+                help: Some("try using the `to nuon` command".into()),
+            },
+            span,
+        ),
+        Value::Binary { .. } => Value::error(binary_input_error(span), span),
+        Value::Custom { val, .. } => {
+            // Only custom values that have a base value that can be converted to string are
+            // accepted.
+            val.to_base_value(input.span())
+                .and_then(|base_value| match action(&base_value, args, span) {
+                    Value::Error { .. } => Err(ShellError::CantConvert {
+                        to_type: String::from("string"),
+                        from_type: val.type_name(),
+                        span,
+                        help: Some("this custom value can't be represented as a string".into()),
+                    }),
+                    success => Ok(success),
+                })
+                .unwrap_or_else(|err| Value::error(err, span))
+        }
+        Value::Error { .. } => input.clone(),
+        x => Value::error(
+            ShellError::CantConvert {
+                to_type: String::from("string"),
+                from_type: x.get_type().to_string(),
+                span,
+                help: None,
+            },
+            span,
+        ),
+    }
+}
+
+/// `into string` never decodes bytes, so binary input always ends up here.
+/// The help points to `decode`, which is the command that does that conversion.
+fn binary_input_error(span: Span) -> ShellError {
+    ShellError::CantConvert {
+        to_type: "string".into(),
+        from_type: "binary".into(),
+        span,
+        help: Some(
+            "`into string` does not decode bytes; use the `decode` command instead, for example `decode utf-8`"
+                .into(),
+        ),
+    }
+}
+
+fn format_int(int: i64, group_digits: bool, decimals: usize) -> String {
+    let locale = get_system_locale();
+
+    let str = if group_digits {
+        int.to_formatted_string(&locale)
+    } else if int < 0 {
+        format!("{}{}", locale.minus_sign(), int.unsigned_abs())
+    } else {
+        int.to_string()
+    };
+
+    if decimals > 0 {
+        let decimal_point = locale.decimal();
+
+        format!(
+            "{}{decimal_point}{dummy:0<decimals$}",
+            str,
+            decimal_point = decimal_point,
+            dummy = "",
+            decimals = decimals
+        )
+    } else {
+        str
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    #[env(NU_TEST_LOCALE_OVERRIDE = "en_US.utf8")]
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(IntoString)
+    }
+}

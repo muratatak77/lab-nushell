@@ -1,0 +1,277 @@
+#![allow(clippy::byte_char_slices)]
+
+use crate::{
+    TokenContents,
+    lex_once::lex_span,
+    lite_parse,
+    parse_helpers::is_variable,
+    parser::{ensure_not_reserved_variable_name, parse_value},
+};
+use nu_protocol::{
+    ParseError, Span, SyntaxShape, Type, VarId,
+    ast::{Expr, MatchPattern, Pattern},
+    engine::StateWorkingSet,
+    eval_const::eval_constant,
+};
+pub fn garbage(span: Span) -> MatchPattern {
+    MatchPattern {
+        pattern: Pattern::Garbage,
+        guard: None,
+        span,
+    }
+}
+
+pub fn parse_pattern(working_set: &mut StateWorkingSet, span: Span) -> MatchPattern {
+    let bytes = working_set.get_span_contents(span);
+
+    if bytes.starts_with(b"$") {
+        // Variable pattern
+        parse_variable_pattern(working_set, span)
+    } else if bytes.starts_with(b"{") {
+        // Record pattern
+        parse_record_pattern(working_set, span)
+    } else if bytes.starts_with(b"[") {
+        // List pattern
+        parse_list_pattern(working_set, span)
+    } else if bytes == b"_" {
+        MatchPattern {
+            pattern: Pattern::IgnoreValue,
+            guard: None,
+            span,
+        }
+    } else {
+        // Literal / expression pattern (including parenthesized const expressions).
+        // `parse_value` already routes `(` through `parse_paren_expr`.
+        parse_value_pattern(working_set, span)
+    }
+}
+
+/// Parse a non-structural match pattern and const-evaluate it to [`Pattern::Value`].
+///
+/// Parenthesized expressions, bare literals, and ranges all go through the normal value
+/// parser, then `eval_constant`. Non-constant expressions become parse errors rather than
+/// silently failing to match at runtime.
+fn parse_value_pattern(working_set: &mut StateWorkingSet, span: Span) -> MatchPattern {
+    let expr = parse_value(working_set, span, &SyntaxShape::Any, None);
+
+    // Avoid stacking a const-eval error on top of an existing parse failure.
+    if matches!(expr.expr, Expr::Garbage) {
+        return garbage(span);
+    }
+
+    match eval_constant(working_set, &expr) {
+        Ok(val) => MatchPattern {
+            pattern: Pattern::Value(val),
+            guard: None,
+            span,
+        },
+        Err(e) => {
+            working_set.error(e.wrap(working_set, span));
+            garbage(span)
+        }
+    }
+}
+
+fn parse_variable_pattern_helper(working_set: &mut StateWorkingSet, span: Span) -> Option<VarId> {
+    let bytes = working_set.get_span_contents(span);
+
+    if is_variable(bytes) {
+        if let Some(var_id) = working_set.find_variable_in_current_frame(bytes) {
+            Some(var_id)
+        } else {
+            let name = bytes.to_vec();
+            ensure_not_reserved_variable_name(working_set, &name, span);
+
+            let var_id = working_set.add_variable(name, span, Type::Any, false);
+            Some(var_id)
+        }
+    } else {
+        None
+    }
+}
+
+pub fn parse_variable_pattern(working_set: &mut StateWorkingSet, span: Span) -> MatchPattern {
+    if let Some(var_id) = parse_variable_pattern_helper(working_set, span) {
+        MatchPattern {
+            pattern: Pattern::Variable(var_id),
+            guard: None,
+            span,
+        }
+    } else {
+        working_set.error(ParseError::Expected("valid variable name", span));
+        garbage(span)
+    }
+}
+
+pub fn parse_list_pattern(working_set: &mut StateWorkingSet, span: Span) -> MatchPattern {
+    let bytes = working_set.get_span_contents(span);
+
+    let mut start = span.start;
+    let mut end = span.end;
+
+    if bytes.starts_with(b"[") {
+        start += 1;
+    }
+    if bytes.ends_with(b"]") {
+        end -= 1;
+    } else {
+        let open = ParseError::opener_span(span, 1);
+        working_set.error(ParseError::unclosed("]", open, Span::new(end, end)));
+    }
+
+    let inner_span = Span::new(start, end);
+    let (output, err) = lex_span(working_set, inner_span, &[b'\n', b'\r', b','], &[], true);
+    if let Some(err) = err {
+        working_set.error(err);
+    }
+
+    if let Some(token) = output
+        .iter()
+        .find(|token| token.contents == TokenContents::Semicolon)
+    {
+        working_set.error(ParseError::LabeledErrorWithHelp {
+            error: "Unexpected semicolon in list pattern".into(),
+            label: "not a valid list separator".into(),
+            help: "Use commas or whitespace to separate list items.".into(),
+            span: token.span,
+        });
+    }
+
+    let (output, err) = lite_parse(&output, working_set);
+    if let Some(err) = err {
+        working_set.error(err);
+    }
+
+    let mut args = vec![];
+    // Like a Rust slice pattern, a list pattern may hold one `..` or `..$name`, at any position.
+    let mut has_rest = false;
+
+    if !output.block.is_empty() {
+        for command in &output.block[0].commands {
+            for &part in &command.parts {
+                let contents = working_set.get_span_contents(part);
+
+                let arg = if contents == b".." {
+                    MatchPattern {
+                        pattern: Pattern::IgnoreRest,
+                        guard: None,
+                        span: part,
+                    }
+                } else if contents.starts_with(b"..$") {
+                    if let Some(var_id) = parse_variable_pattern_helper(
+                        working_set,
+                        Span::new(part.start + 2, part.end),
+                    ) {
+                        MatchPattern {
+                            pattern: Pattern::Rest(var_id),
+                            guard: None,
+                            span: part,
+                        }
+                    } else {
+                        working_set.error(ParseError::Expected("valid variable name", part));
+                        garbage(part)
+                    }
+                } else {
+                    parse_pattern(working_set, part)
+                };
+
+                let is_rest = matches!(arg.pattern, Pattern::IgnoreRest | Pattern::Rest(_));
+                if is_rest && has_rest {
+                    // An extra `..$name` was still parsed above, so its variable is declared
+                    // and the arm body reports only this error, not also "Variable not found".
+                    working_set.error(ParseError::LabeledErrorWithHelp {
+                        error: "`..` can only be used once per list pattern".into(),
+                        label: "extra rest pattern".into(),
+                        help: "Keep one `..` or `..$name` and remove the others.".into(),
+                        span: part,
+                    });
+                    args.push(garbage(part));
+                } else {
+                    has_rest |= is_rest;
+                    args.push(arg);
+                }
+            }
+        }
+    }
+
+    MatchPattern {
+        pattern: Pattern::List(args),
+        guard: None,
+        span,
+    }
+}
+
+pub fn parse_record_pattern(working_set: &mut StateWorkingSet, span: Span) -> MatchPattern {
+    let mut bytes = working_set.get_span_contents(span);
+
+    let mut start = span.start;
+    let mut end = span.end;
+
+    if bytes.starts_with(b"{") {
+        start += 1;
+    } else {
+        working_set.error(ParseError::Expected("{", Span::new(start, start + 1)));
+        bytes = working_set.get_span_contents(span);
+    }
+
+    if bytes.ends_with(b"}") {
+        end -= 1;
+    } else {
+        let open = ParseError::opener_span(span, 1);
+        working_set.error(ParseError::unclosed("}", open, Span::new(end, end)));
+    }
+
+    let inner_span = Span::new(start, end);
+    let (tokens, err) = lex_span(
+        working_set,
+        inner_span,
+        &[b'\n', b'\r', b','],
+        &[b':'],
+        true,
+    );
+    if let Some(err) = err {
+        working_set.error(err);
+    }
+
+    let mut output = vec![];
+    let mut idx = 0;
+
+    while idx < tokens.len() {
+        let bytes = working_set.get_span_contents(tokens[idx].span);
+        let (field, pattern) = if !bytes.is_empty() && bytes[0] == b'$' {
+            // If this is a variable, treat it as both the name of the field and the pattern
+            let field = String::from_utf8_lossy(&bytes[1..]).to_string();
+
+            let pattern = parse_variable_pattern(working_set, tokens[idx].span);
+
+            (field, pattern)
+        } else {
+            let field = String::from_utf8_lossy(bytes).to_string();
+
+            idx += 1;
+            if idx == tokens.len() {
+                working_set.error(ParseError::Expected("record", span));
+                return garbage(span);
+            }
+            let colon = working_set.get_span_contents(tokens[idx].span);
+            idx += 1;
+            if idx == tokens.len() || colon != b":" {
+                //FIXME: need better error
+                working_set.error(ParseError::Expected("record", span));
+                return garbage(span);
+            }
+            let pattern = parse_pattern(working_set, tokens[idx].span);
+
+            (field, pattern)
+        };
+        idx += 1;
+
+        output.push((field, pattern));
+    }
+
+    MatchPattern {
+        pattern: Pattern::Record(output),
+        guard: None,
+        span,
+    }
+}

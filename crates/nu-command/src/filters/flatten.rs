@@ -1,0 +1,441 @@
+use indexmap::IndexMap;
+use nu_engine::command_prelude::*;
+use nu_protocol::ast::PathMember;
+use std::collections::HashSet;
+
+#[derive(Clone)]
+pub struct Flatten;
+
+impl Command for Flatten {
+    fn name(&self) -> &str {
+        "flatten"
+    }
+
+    fn signature(&self) -> Signature {
+        Signature::build("flatten")
+            .input_output_types(vec![
+                (
+                    Type::List(Box::new(Type::Any)),
+                    Type::List(Box::new(Type::Any)),
+                ),
+                (Type::record(), Type::table()),
+            ])
+            .rest(
+                "rest",
+                SyntaxShape::String,
+                "Optionally flatten data by column.",
+            )
+            .switch("all", "Flatten inner table one level out.", Some('a'))
+            .category(Category::Filters)
+    }
+
+    fn description(&self) -> &str {
+        "Flatten a table by extracting nested values."
+    }
+
+    fn extra_description(&self) -> &str {
+        "A record is treated as a one-row table, so the output is always a table.\n\
+         Fields of a nested record are lifted to the top level and the parent key is dropped.\n\
+         If a lifted field would collide with a top-level column, it is renamed to `<parent>_<field>`.\n\
+         If a lifted and renamed field would still collide with a top-level column, an error is raised.\n\
+         A nested list is expanded into one row per element."
+    }
+
+    fn run(
+        &self,
+        engine_state: &EngineState,
+        stack: &mut Stack,
+        call: &Call,
+        input: PipelineData,
+    ) -> Result<PipelineData, ShellError> {
+        flatten(engine_state, stack, call, input)
+    }
+
+    fn examples(&self) -> Vec<Example<'_>> {
+        vec![
+            Example {
+                description: "flatten a table.",
+                example: "[[N, u, s, h, e, l, l]] | flatten ",
+                result: Some(Value::test_list(vec![
+                    Value::test_string("N"),
+                    Value::test_string("u"),
+                    Value::test_string("s"),
+                    Value::test_string("h"),
+                    Value::test_string("e"),
+                    Value::test_string("l"),
+                    Value::test_string("l"),
+                ])),
+            },
+            Example {
+                description: "flatten a table, get the first item.",
+                example: "[[N, u, s, h, e, l, l]] | flatten | first",
+                result: None, //Some(Value::test_string("N")),
+            },
+            Example {
+                description: "flatten a column having a nested table.",
+                example: "[[origin, people]; [Ecuador, ([[name, meal]; ['Andres', 'arepa']])]] | flatten --all | get meal",
+                result: None, //Some(Value::test_string("arepa")),
+            },
+            Example {
+                description: "restrict the flattening by passing column names.",
+                example: "[[origin, crate, versions]; [World, ([[name]; ['nu-cli']]), ['0.21', '0.22']]] | flatten versions --all | last | get versions",
+                result: None, //Some(Value::test_string("0.22")),
+            },
+            Example {
+                description: "Flatten a record: nested record fields are lifted, and a lifted field that collides with a top-level column is prefixed with its parent key.",
+                example: "{ a: { b: 1, c: 2 }, c: 3 } | flatten",
+                result: Some(Value::test_list(vec![Value::test_record(record! {
+                    "b" => Value::test_int(1),
+                    "a_c" => Value::test_int(2),
+                    "c" => Value::test_int(3),
+                })])),
+            },
+            Example {
+                description: "Flatten inner table.",
+                example: "{ a: b, d: [ 1 2 3 4 ], e: [ 4 3 ] } | flatten d --all",
+                result: Some(Value::list(
+                    vec![
+                        Value::test_record(record! {
+                                "a" => Value::test_string("b"),
+                                "d" => Value::test_int(1),
+                                "e" => Value::test_list(
+                                    vec![Value::test_int(4), Value::test_int(3)],
+                                ),
+                        }),
+                        Value::test_record(record! {
+                                "a" => Value::test_string("b"),
+                                "d" => Value::test_int(2),
+                                "e" => Value::test_list(
+                                    vec![Value::test_int(4), Value::test_int(3)],
+                                ),
+                        }),
+                        Value::test_record(record! {
+                                "a" => Value::test_string("b"),
+                                "d" => Value::test_int(3),
+                                "e" => Value::test_list(
+                                    vec![Value::test_int(4), Value::test_int(3)],
+                                ),
+                        }),
+                        Value::test_record(record! {
+                                "a" => Value::test_string("b"),
+                                "d" => Value::test_int(4),
+                                "e" => Value::test_list(
+                                    vec![Value::test_int(4), Value::test_int(3)],
+                                )
+                        }),
+                    ],
+                    Span::test_data(),
+                )),
+            },
+        ]
+    }
+}
+
+fn flatten(
+    engine_state: &EngineState,
+    stack: &mut Stack,
+    call: &Call,
+    mut input: PipelineData,
+) -> Result<PipelineData, ShellError> {
+    let columns: Vec<CellPath> = call.rest(engine_state, stack, 0)?;
+    let metadata = input.take_metadata();
+    let flatten_all = call.has_flag(engine_state, stack, "all")?;
+
+    input
+        .flat_map(
+            move |item| flat_value(&columns, item, flatten_all),
+            engine_state.signals(),
+        )
+        .map(|x| x.set_metadata(metadata))
+}
+
+enum TableInside {
+    // handle for a column which contains a single list(but not list of records)
+    // it contains (column, span, values in the column, column index).
+    Entries(String, Vec<Value>, usize),
+    // handle for a column which contains a table, we can flatten the inner column to outer level
+    // `records` is the nested/inner table to flatten to the outer level
+    // `parent_column_name` is handled for conflicting column name, the nested table may contains columns which has the same name
+    // to outer level, for that case, the output column name should be f"{parent_column_name}_{inner_column_name}".
+    // `parent_column_index` is the column index in original table.
+    FlattenedRows {
+        records: Vec<Record>,
+        parent_column_name: String,
+        parent_column_index: usize,
+    },
+}
+
+fn flat_value(columns: &[CellPath], item: Value, all: bool) -> Vec<Value> {
+    let tag = item.span();
+
+    match item {
+        Value::Record { val, .. } => {
+            let val = val.into_owned();
+            // Top-level columns that keep their name in the output. A lifted inner field
+            // that collides with one of these is renamed to `<parent>_<field>` instead of
+            // silently being overwritten (or overwriting it), regardless of field order.
+            let retained_outer_columns: Vec<String> = val
+                .iter()
+                .filter_map(|(column, value)| {
+                    let column_requested = columns.iter().find(|c| c.to_column_name() == *column);
+                    let need_flatten = columns.is_empty() || column_requested.is_some();
+
+                    let will_flatten = match value {
+                        Value::Record { .. } => need_flatten,
+                        Value::List { vals, .. } => {
+                            all && vals.iter().all(|value| value.as_record().is_ok())
+                                && need_flatten
+                        }
+                        _ => false,
+                    };
+
+                    (!will_flatten).then_some(column.clone())
+                })
+                .collect();
+
+            // Reserve the new names of the columns that will be renamed to `<parent>_<field>`,
+            // so that we can handle situations where the lifted field will first collide and
+            // be renamed, and then collide again with the new name. No further renaming is
+            // allowed after the first rename, so an error will be thrown instead.
+            let reserved_renames: HashSet<String> = val
+                .iter()
+                .filter_map(|(column, value)| match value {
+                    Value::Record { val, .. } => {
+                        let column_requested =
+                            columns.iter().find(|c| c.to_column_name() == *column);
+                        let need_flatten = columns.is_empty() || column_requested.is_some();
+                        if !need_flatten {
+                            return None;
+                        }
+
+                        let renames: Vec<String> = val
+                            .columns()
+                            .filter(|col| retained_outer_columns.contains(col))
+                            .map(|col| format!("{column}_{col}"))
+                            .collect();
+                        Some(renames)
+                    }
+                    _ => None,
+                })
+                .flatten()
+                .collect();
+
+            let mut out = IndexMap::<String, Value>::new();
+            let mut inner_table = None;
+
+            for (column_index, (column, value)) in val.into_iter().enumerate() {
+                let column_requested = columns.iter().find(|c| c.to_column_name() == column);
+                let need_flatten = { columns.is_empty() || column_requested.is_some() };
+                let span = value.span();
+
+                match value {
+                    Value::Record { ref val, .. } => {
+                        if need_flatten {
+                            for (col, val) in val.clone().into_owned() {
+                                let val_span = val.span();
+                                let name = if out.contains_key(&col)
+                                    || retained_outer_columns.contains(&col)
+                                    || reserved_renames.contains(&col)
+                                {
+                                    format!("{column}_{col}")
+                                } else {
+                                    col
+                                };
+                                if let Some(previous) = out.insert(name.clone(), val) {
+                                    let error =
+                                        column_defined_twice(name, previous.span(), val_span);
+                                    return vec![error];
+                                }
+                            }
+                        } else if let Some(previous) = out.insert(column.clone(), value) {
+                            let error = column_defined_twice(column, previous.span(), span);
+                            return vec![error];
+                        }
+                    }
+                    Value::List { vals, .. } => {
+                        if need_flatten && inner_table.is_some() {
+                            return vec![Value::error(
+                                ShellError::UnsupportedInput {
+                                    msg: "can only flatten one inner list at a time. tried flattening more than one column with inner lists... but is flattened already".into(),
+                                    input: "value originates from here".into(),
+                                    msg_span: tag,
+                                    input_span: span
+                                },
+                                span,
+                            )];
+                        }
+
+                        if all && vals.iter().all(|f| f.as_record().is_ok()) {
+                            // it's a table (a list of record, we can flatten inner record)
+                            if need_flatten {
+                                let records = vals
+                                    .into_iter()
+                                    .filter_map(|v| v.into_record().ok())
+                                    .collect();
+
+                                inner_table = Some(TableInside::FlattenedRows {
+                                    records,
+                                    parent_column_name: column,
+                                    parent_column_index: column_index,
+                                });
+                            } else if let Some(previous) =
+                                out.insert(column.clone(), Value::list_shared(vals, span))
+                            {
+                                let error = column_defined_twice(column, previous.span(), span);
+                                return vec![error];
+                            }
+                        } else if !columns.is_empty() {
+                            let cell_path =
+                                column_requested.and_then(|x| match x.members.first() {
+                                    Some(PathMember::String { val, .. }) => Some(val),
+                                    _ => None,
+                                });
+
+                            if let Some(r) = cell_path {
+                                inner_table = Some(TableInside::Entries(
+                                    r.clone(),
+                                    vals.into_owned(),
+                                    column_index,
+                                ));
+                            } else if let Some(previous) =
+                                out.insert(column.clone(), Value::list_shared(vals, span))
+                            {
+                                let error = column_defined_twice(column, previous.span(), span);
+                                return vec![error];
+                            }
+                        } else {
+                            inner_table = Some(TableInside::Entries(
+                                column,
+                                vals.into_owned(),
+                                column_index,
+                            ));
+                        }
+                    }
+                    _ => {
+                        if let Some(previous) = out.insert(column.clone(), value) {
+                            let error = column_defined_twice(column, previous.span(), span);
+                            return vec![error];
+                        }
+                    }
+                }
+            }
+
+            let mut expanded = vec![];
+            match inner_table {
+                Some(TableInside::Entries(column, entries, parent_column_index)) => {
+                    for entry in entries {
+                        let base = out.clone();
+                        let mut record = Record::new();
+                        let mut index = 0;
+                        for (col, val) in base.into_iter() {
+                            // meet the flattened column, push them to result record first
+                            // this can avoid output column order changed.
+                            if index == parent_column_index
+                                && let Err(error) =
+                                    push_unique(&mut record, column.clone(), entry.clone())
+                            {
+                                return vec![error];
+                            }
+                            if let Err(error) = push_unique(&mut record, col, val) {
+                                return vec![error];
+                            }
+                            index += 1;
+                        }
+                        // the flattened column may be the last column in the original table.
+                        if index == parent_column_index
+                            && let Err(error) = push_unique(&mut record, column.clone(), entry)
+                        {
+                            return vec![error];
+                        }
+                        expanded.push(Value::record(record, tag));
+                    }
+                }
+                Some(TableInside::FlattenedRows {
+                    records,
+                    parent_column_name,
+                    parent_column_index,
+                }) => {
+                    for inner_record in records {
+                        let base = out.clone();
+                        let mut record = Record::new();
+                        let mut index = 0;
+
+                        for (base_col, base_val) in base {
+                            // meet the flattened column, push them to result record first
+                            // this can avoid output column order changed.
+                            if index == parent_column_index {
+                                for (col, val) in &inner_record {
+                                    let name = if record.contains(col) || out.contains_key(col) {
+                                        format!("{parent_column_name}_{col}")
+                                    } else {
+                                        col.clone()
+                                    };
+                                    if let Err(error) = push_unique(&mut record, name, val.clone())
+                                    {
+                                        return vec![error];
+                                    }
+                                }
+                            }
+                            if let Err(error) = push_unique(&mut record, base_col, base_val) {
+                                return vec![error];
+                            }
+                            index += 1;
+                        }
+
+                        // the flattened column may be the last column in the original table.
+                        if index == parent_column_index {
+                            for (col, val) in inner_record {
+                                let name = if record.contains(&col) || out.contains_key(&col) {
+                                    format!("{parent_column_name}_{col}")
+                                } else {
+                                    col
+                                };
+                                if let Err(error) = push_unique(&mut record, name, val) {
+                                    return vec![error];
+                                }
+                            }
+                        }
+                        expanded.push(Value::record(record, tag));
+                    }
+                }
+                None => {
+                    expanded.push(Value::record(out.into_iter().collect(), tag));
+                }
+            }
+            expanded
+        }
+        Value::List { vals, .. } => vals.into_owned(),
+        item => vec![item],
+    }
+}
+
+fn column_defined_twice(col_name: String, first_use: Span, second_use: Span) -> Value {
+    Value::error(
+        ShellError::ColumnDefinedTwice {
+            col_name,
+            second_use,
+            first_use,
+        },
+        second_use,
+    )
+}
+
+/// Push `name`: `val` onto `record` if `name` is not present in `record`
+fn push_unique(record: &mut Record, name: String, val: Value) -> Result<(), Value> {
+    if let Some(previous) = record.get(&name) {
+        let error = column_defined_twice(name, previous.span(), val.span());
+        return Err(error);
+    }
+    record.push(name, val);
+    Ok(())
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_examples() -> nu_test_support::Result {
+        nu_test_support::test().examples(Flatten)
+    }
+}

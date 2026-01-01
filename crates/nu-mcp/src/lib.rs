@@ -1,0 +1,236 @@
+use hyper_util::{
+    rt::{TokioExecutor, TokioIo},
+    server::conn::auto::Builder,
+    service::TowerToHyperService,
+};
+use nu_protocol::{ShellError, engine::EngineState, shell_error::generic::GenericError};
+use rmcp::{
+    ServiceExt,
+    transport::{
+        stdio,
+        streamable_http_server::{
+            StreamableHttpServerConfig, StreamableHttpService,
+            session::local::{LocalSessionManager, SessionConfig},
+        },
+    },
+};
+use server::NushellMcpServer;
+use std::net::Ipv6Addr;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::runtime::Runtime;
+use tokio_util::sync::CancellationToken;
+use tracing_subscriber::EnvFilter;
+
+mod evaluation;
+mod history;
+mod server;
+
+/// MCP transport configuration
+#[derive(Debug, Clone, Default)]
+pub enum McpTransport {
+    /// Standard IO transport (default)
+    #[default]
+    Stdio,
+    /// HTTP transport with SSE streaming
+    Http {
+        /// Address to bind to (default: 127.0.0.1)
+        bind_host: String,
+        /// Port to listen on
+        bind_port: u16,
+        /// Optional list of allowed `Host` header values, guarding against DNS-rebinding
+        /// attacks (default: rmcp's built-in loopback-only list)
+        allowed_hosts: Option<Vec<String>>,
+        /// Optional list of allowed `Origin` header values for HTTP request validation
+        /// (default: none, which disables Origin validation for backward compatibility)
+        allowed_origins: Option<Vec<String>>,
+    },
+}
+
+impl McpTransport {
+    /// Create a new MCP transport configuration for HTTP, using rmcp's default
+    /// `Host`/`Origin` validation. Use [`McpTransport::with_allowed_hosts`] and
+    /// [`McpTransport::with_allowed_origins`] to customize it.
+    pub fn http(bind_address: Option<String>, port: Option<u16>) -> Self {
+        McpTransport::Http {
+            bind_host: bind_address.unwrap_or("127.0.0.1".into()),
+            bind_port: port.unwrap_or(8080),
+            allowed_hosts: None,
+            allowed_origins: None,
+        }
+    }
+
+    /// Set the allowed `Host` header values for the HTTP transport.
+    /// Has no effect on [`McpTransport::Stdio`].
+    pub fn with_allowed_hosts(mut self, hosts: Option<Vec<String>>) -> Self {
+        if let McpTransport::Http { allowed_hosts, .. } = &mut self {
+            *allowed_hosts = hosts;
+        }
+        self
+    }
+
+    /// Set the allowed CORS origins for the HTTP transport.
+    /// Has no effect on [`McpTransport::Stdio`].
+    pub fn with_allowed_origins(mut self, origins: Option<Vec<String>>) -> Self {
+        if let McpTransport::Http {
+            allowed_origins, ..
+        } = &mut self
+        {
+            *allowed_origins = origins;
+        }
+        self
+    }
+}
+
+pub fn initialize_mcp_server(
+    mut engine_state: EngineState,
+    transport: McpTransport,
+) -> Result<(), ShellError> {
+    if let Err(err) = tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env().add_directive(tracing::Level::DEBUG.into()))
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        // The MCP host owns our stderr pipe and closes it on exit. Once closed, every
+        // event write returns `Err(BrokenPipe)`, and the default fallback runs `eprintln!`, which
+        // panics on a broken pipe.
+        .log_internal_errors(false)
+        .try_init()
+    {
+        tracing::debug!("tracing subscriber already initialized: {err}");
+    }
+
+    // Detach from controlling terminal to prevent child processes from prompting for input.
+    //
+    // Many programs (ssh, sudo, psql, etc.) bypass stdin and open /dev/tty directly for
+    // password prompts. By calling setsid(), we create a new session without a controlling
+    // terminal, causing /dev/tty to be unavailable. This makes these programs fail fast
+    // with clear errors instead of hanging indefinitely waiting for input.
+    //
+    // See: https://man7.org/linux/man-pages/man2/setsid.2.html
+    #[cfg(unix)]
+    {
+        // Ignore error - setsid fails if we're already a session leader, which is fine
+        let _ = nix::unistd::setsid();
+    }
+
+    // MCP servers run non-interactively - external commands should not inherit stdin
+    // as this would cause them to hang when prompting for passwords or other input.
+    engine_state.is_mcp = true;
+
+    tracing::info!(?transport, "Starting MCP server");
+    let runtime = Runtime::new().map_err(|e| {
+        ShellError::Generic(GenericError::new_internal(
+            format!("Could not instantiate tokio: {e}"),
+            "",
+        ))
+    })?;
+
+    runtime.block_on(async {
+        let result = match transport {
+            McpTransport::Stdio => run_stdio_server(engine_state).await,
+            McpTransport::Http {
+                bind_host,
+                bind_port,
+                allowed_hosts,
+                allowed_origins,
+            } => {
+                // Bare IPv6 literals (e.g. `::1`) must be bracketed to form a valid
+                // socket address; hostnames, IPv4, and already-bracketed hosts are used as-is.
+                let addr = if bind_host.parse::<Ipv6Addr>().is_ok() {
+                    format!("[{bind_host}]:{bind_port}")
+                } else {
+                    format!("{bind_host}:{bind_port}")
+                };
+                run_http_server(engine_state, &addr, allowed_hosts, allowed_origins).await
+            }
+        };
+        if let Err(e) = result {
+            tracing::error!("Error running MCP server: {:?}", e);
+        }
+    });
+    Ok(())
+}
+
+async fn run_stdio_server(engine_state: EngineState) -> Result<(), Box<dyn std::error::Error>> {
+    NushellMcpServer::new(engine_state)
+        .serve(stdio())
+        .await
+        .inspect_err(|e| {
+            tracing::error!("serving error: {:?}", e);
+        })?
+        .waiting()
+        .await?;
+    Ok(())
+}
+
+/// Session idle timeout before cleanup (30 minutes)
+const SESSION_KEEP_ALIVE: Duration = Duration::from_secs(30 * 60);
+
+/// Channel capacity for session message buffering
+const SESSION_CHANNEL_CAPACITY: usize = 16;
+
+async fn run_http_server(
+    engine_state: EngineState,
+    bind_address: &str,
+    bind_hosts: Option<Vec<String>>,
+    bind_origins: Option<Vec<String>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let engine_state = Arc::new(engine_state);
+
+    // Create cancellation token to propagate shutdown to all sessions/streams
+    let cancellation_token = CancellationToken::new();
+
+    let mut session_config = SessionConfig::default();
+    session_config.channel_capacity = SESSION_CHANNEL_CAPACITY;
+    session_config.keep_alive = Some(SESSION_KEEP_ALIVE);
+
+    let mut session_manager = LocalSessionManager::default();
+    session_manager.session_config = session_config;
+    let session_manager = Arc::new(session_manager);
+
+    // Only override rmcp's defaults when the user explicitly configured a list: rmcp's
+    // default `allowed_hosts` (loopback only) guards against DNS-rebinding attacks, and
+    // passing an empty Vec here would disable that protection by allowing any Host header.
+    let mut http_config = StreamableHttpServerConfig::default();
+    if let Some(hosts) = bind_hosts.filter(|hosts| !hosts.is_empty()) {
+        http_config = http_config.with_allowed_hosts(hosts);
+    }
+    if let Some(origins) = bind_origins {
+        http_config = http_config.with_allowed_origins(origins);
+    }
+
+    let service = TowerToHyperService::new(StreamableHttpService::new(
+        {
+            let engine_state = engine_state.clone();
+            move || Ok(NushellMcpServer::new((*engine_state).clone()))
+        },
+        session_manager,
+        http_config.clone(),
+    ));
+
+    let listener = tokio::net::TcpListener::bind(bind_address).await?;
+    tracing::info!("MCP HTTP server listening on http://{bind_address}");
+    tracing::info!("Allowed hosts: {:?}", http_config.allowed_hosts);
+    tracing::info!("Allowed origins: {:?}", http_config.allowed_origins);
+    eprintln!("MCP HTTP server listening on http://{bind_address}");
+
+    loop {
+        let io = tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("Received Ctrl-C, shutting down...");
+                cancellation_token.cancel();
+                break;
+            }
+            accept = listener.accept() => {
+                TokioIo::new(accept?.0)
+            }
+        };
+        let service = service.clone();
+        tokio::spawn(async move {
+            let _ = Builder::new(TokioExecutor::new())
+                .serve_connection(io, service)
+                .await;
+        });
+    }
+    Ok(())
+}

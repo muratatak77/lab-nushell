@@ -1,0 +1,850 @@
+use nu_plugin_protocol::{StreamData, StreamId, StreamMessage};
+use nu_protocol::{ShellError, Span, Value, shell_error::generic::GenericError};
+use std::{
+    collections::{BTreeMap, btree_map},
+    iter::FusedIterator,
+    marker::PhantomData,
+    sync::{
+        Arc, Condvar, Mutex, MutexGuard, Weak,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
+};
+
+#[cfg(test)]
+mod tests;
+
+/// Messages for a reader's local queue, never sent over the plugin protocol.
+#[derive(Debug)]
+enum ReaderMessage {
+    Incoming(Result<Option<StreamData>, ShellError>),
+    Cancel,
+}
+
+/// Internal notification for permanently cancelling one transport reader.
+///
+/// Clones cancel the same stream. Dropping a handle does not cancel the stream, and keeping a
+/// handle does not keep its reader, buffered data, or transport alive. Cancellation affects only
+/// waits in the transport reader; it cannot interrupt arbitrary iterators, deserialization, or
+/// writes to the output transport, or retract data already returned to the caller.
+#[derive(Debug, Clone)]
+#[doc(hidden)]
+pub struct StreamReaderSignal {
+    state: Arc<StreamReaderSignalState>,
+    sender: Weak<mpsc::Sender<ReaderMessage>>,
+}
+
+#[derive(Debug, Default)]
+struct StreamReaderSignalState {
+    cancelled: AtomicBool,
+    holds: Mutex<StreamReaderHolds>,
+}
+
+#[derive(Debug, Default)]
+struct StreamReaderHolds {
+    active: usize,
+    cancel_requested: bool,
+}
+
+/// Keeps a reader open while an SDK-owned forwarding writer still has a consumer.
+///
+/// This does not keep the reader or transport alive. Releasing the last hold publishes any
+/// deferred cancellation without transport I/O or stream-manager callbacks.
+#[derive(Debug)]
+#[doc(hidden)]
+pub struct StreamReaderHold(StreamReaderSignal);
+
+impl StreamReaderSignal {
+    fn new(sender: &Arc<mpsc::Sender<ReaderMessage>>) -> Self {
+        Self {
+            state: Arc::new(StreamReaderSignalState::default()),
+            sender: Arc::downgrade(sender),
+        }
+    }
+
+    fn holds(&self) -> MutexGuard<'_, StreamReaderHolds> {
+        // This private bookkeeping has no user callbacks. Setup and terminal cleanup must remain
+        // infallible even if a panic while formatting the state poisoned the mutex.
+        self.state
+            .holds
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+    }
+
+    /// Defer cancellation requests while an SDK-owned writer is forwarding input.
+    /// Acquiring a hold cannot revive a reader that has already been cancelled or ended.
+    pub fn hold(&self) -> StreamReaderHold {
+        // Each increment creates one non-cloneable guard with exactly one matching decrement.
+        self.holds().active += 1;
+        StreamReaderHold(self.clone())
+    }
+
+    /// Request cancellation after all SDK-owned forwarding consumers have finished or dropped
+    /// their streams. With no holds this wakes the reader immediately, independently of GC.
+    pub fn cancel_when_released(&self) {
+        let mut holds = self.holds();
+        holds.cancel_requested = true;
+        if holds.active == 0 {
+            self.cancel();
+        }
+    }
+
+    /// Request cancellation, waking an idle reader without waiting for data from its producer.
+    ///
+    /// This is idempotent and does not write to the transport or wait for the reader to finish.
+    /// Once observed, cancellation discards the reader's queue and reports an interruption before
+    /// ending further reads. A read already in progress may race with this request.
+    /// Calling this after the reader has ended
+    /// or been dropped is harmless. There is no reset operation.
+    pub fn cancel(&self) {
+        if !self.state.cancelled.swap(true, Ordering::AcqRel)
+            && let Some(sender) = self.sender.upgrade()
+        {
+            // The flag takes priority over queued data; the message wakes a blocking recv().
+            let _ = sender.send(ReaderMessage::Cancel);
+        }
+    }
+}
+
+impl Drop for StreamReaderHold {
+    fn drop(&mut self) {
+        let mut holds = self.0.holds();
+        holds.active -= 1;
+        if holds.active == 0 && holds.cancel_requested {
+            self.0.cancel();
+        }
+    }
+}
+
+/// Receives messages from a stream read from input by a [`StreamManager`].
+///
+/// The receiver reads stream events from a local channel managed by a [`StreamManager`].
+/// End-of-stream is explicit, and local cancellation can wake a blocked receive.
+///
+/// Failing to receive is an error. When end-of-stream is received, the `receiver` is set to `None`
+/// and all further calls to `next()` return `None`.
+///
+/// The type `T` must implement [`FromShellError`], so that errors in the stream can be represented,
+/// and `TryFrom<StreamData>` to convert it to the correct type.
+///
+/// Each consumed data message sends [`StreamMessage::Ack`] to the writer. Cancellation reports
+/// [`ShellError::Interrupted`], not a successful end-of-stream. Cancellation or dropping the
+/// reader sends [`StreamMessage::Drop`] at most once.
+#[derive(Debug)]
+pub struct StreamReader<T, W>
+where
+    W: WriteStreamMessage,
+{
+    id: StreamId,
+    receiver: Option<mpsc::Receiver<ReaderMessage>>,
+    writer: W,
+    cancellation: StreamReaderSignal,
+    span: Span,
+    drop_sent: bool,
+    /// Iterator requires the item type to be fixed, so we have to keep it as part of the type,
+    /// even though we're actually receiving dynamic data.
+    marker: PhantomData<fn() -> T>,
+}
+
+impl<T, W> StreamReader<T, W>
+where
+    T: TryFrom<StreamData, Error = ShellError>,
+    W: WriteStreamMessage,
+{
+    /// Create a new StreamReader from parts
+    fn new(
+        id: StreamId,
+        receiver: mpsc::Receiver<ReaderMessage>,
+        writer: W,
+        cancellation: StreamReaderSignal,
+    ) -> StreamReader<T, W> {
+        StreamReader {
+            id,
+            receiver: Some(receiver),
+            writer,
+            cancellation,
+            span: Span::unknown(),
+            drop_sent: false,
+            marker: PhantomData,
+        }
+    }
+
+    pub(super) fn with_span(mut self, span: Span) -> Self {
+        self.span = span;
+        self
+    }
+
+    /// Get a handle that cancels only this reader's transport input.
+    #[doc(hidden)]
+    pub fn cancellation(&self) -> StreamReaderSignal {
+        self.cancellation.clone()
+    }
+
+    /// Receive a message from the channel, or return an error if:
+    ///
+    /// * the channel couldn't be received from
+    /// * an error was sent on the channel
+    /// * the message received couldn't be converted to `T`
+    /// * the reader was cancelled (subsequent reads return `Ok(None)`)
+    /// * writing an acknowledgement or writing/flushing the cancellation's Drop failed
+    /// * flushing pending acknowledgements before waiting failed
+    ///
+    /// Cancellation discards queued data without acknowledging it. An error dequeued by this
+    /// call takes precedence over cancellation; errors behind that message are discarded with
+    /// the queue. Only a producer's End is a successful end-of-stream.
+    pub fn recv(&mut self) -> Result<Option<T>, ShellError> {
+        let connection_lost = || {
+            ShellError::Generic(GenericError::new_internal(
+                "Stream ended unexpectedly",
+                "connection lost before explicit end of stream",
+            ))
+        };
+
+        if let Some(ref rx) = self.receiver {
+            // Try to receive a message first
+            let msg = match rx.try_recv() {
+                Ok(msg) => msg,
+                Err(mpsc::TryRecvError::Empty) => {
+                    // The receiver doesn't have any messages waiting for us. It's possible that the
+                    // other side hasn't seen our acknowledgements. Let's flush the writer and then
+                    // wait
+                    self.writer.flush()?;
+                    rx.recv().map_err(|_| connection_lost())?
+                }
+                Err(mpsc::TryRecvError::Disconnected) => return Err(connection_lost()),
+            };
+
+            let msg = match msg {
+                // Preserve an incoming error before checking cancellation. Flush and disconnection
+                // errors have already returned above.
+                ReaderMessage::Incoming(msg) => msg?,
+                ReaderMessage::Cancel => return self.cancelled(),
+            };
+            if self.cancellation.state.cancelled.load(Ordering::Acquire) {
+                return self.cancelled();
+            }
+
+            if let Some(data) = msg {
+                // Acknowledge the message
+                self.writer
+                    .write_stream_message(StreamMessage::Ack(self.id))?;
+                // Try to convert it into the correct type
+                Ok(Some(data.try_into()?))
+            } else {
+                // Remove the receiver, so that future recv() calls always return Ok(None)
+                self.receiver = None;
+                Ok(None)
+            }
+        } else {
+            // Closed already
+            Ok(None)
+        }
+    }
+}
+
+impl<T, W: WriteStreamMessage> StreamReader<T, W> {
+    fn cancelled(&mut self) -> Result<Option<T>, ShellError> {
+        self.finish()?;
+        Err(ShellError::Interrupted { span: self.span })
+    }
+
+    /// Close the local queue before notifying the producer, even when notification fails.
+    /// Keep the manager's registration until the peer's real End arrives for in-flight messages.
+    fn finish(&mut self) -> Result<(), ShellError> {
+        self.receiver = None;
+        if !self.drop_sent {
+            self.drop_sent = true;
+            self.writer
+                .write_stream_message(StreamMessage::Drop(self.id))?;
+            self.writer.flush()?;
+        }
+        Ok(())
+    }
+}
+
+impl<T, W> Iterator for StreamReader<T, W>
+where
+    T: FromShellError + TryFrom<StreamData, Error = ShellError>,
+    W: WriteStreamMessage,
+{
+    type Item = T;
+
+    fn next(&mut self) -> Option<T> {
+        // Converting the error to the value here makes the implementation a lot easier
+        match self.recv() {
+            Ok(option) => option,
+            Err(err) => {
+                // Drop the receiver so we don't keep returning errors
+                self.receiver = None;
+                Some(T::from_shell_error(err))
+            }
+        }
+    }
+}
+
+// Guaranteed not to return anything after the end
+impl<T, W> FusedIterator for StreamReader<T, W>
+where
+    T: FromShellError + TryFrom<StreamData, Error = ShellError>,
+    W: WriteStreamMessage,
+{
+}
+
+impl<T, W> Drop for StreamReader<T, W>
+where
+    W: WriteStreamMessage,
+{
+    fn drop(&mut self) {
+        if let Err(err) = self.finish() {
+            log::warn!("Failed to send message to drop stream: {err}");
+        }
+    }
+}
+
+/// Values that can contain a `ShellError` to signal an error has occurred.
+pub trait FromShellError {
+    fn from_shell_error(err: ShellError) -> Self;
+}
+
+// For List streams.
+// Note: Span::unknown() is unavoidable here because this is called from Iterator::next(),
+// which has no span context. The ShellError itself carries its own span information.
+impl FromShellError for Value {
+    fn from_shell_error(err: ShellError) -> Self {
+        Value::error(err, Span::unknown())
+    }
+}
+
+// For Raw streams, mostly.
+impl<T> FromShellError for Result<T, ShellError> {
+    fn from_shell_error(err: ShellError) -> Self {
+        Err(err)
+    }
+}
+
+/// Writes messages to a stream, with flow control.
+///
+/// The `signal` contained
+#[derive(Debug)]
+pub struct StreamWriter<W: WriteStreamMessage> {
+    id: StreamId,
+    signal: Arc<StreamWriterSignal>,
+    writer: W,
+    ended: bool,
+}
+
+impl<W> StreamWriter<W>
+where
+    W: WriteStreamMessage,
+{
+    fn new(id: StreamId, signal: Arc<StreamWriterSignal>, writer: W) -> StreamWriter<W> {
+        StreamWriter {
+            id,
+            signal,
+            writer,
+            ended: false,
+        }
+    }
+
+    /// Check if the stream was dropped from the other end. Recommended to do this before calling
+    /// [`.write()`](Self::write), especially in a loop.
+    pub fn is_dropped(&self) -> Result<bool, ShellError> {
+        self.signal.is_dropped()
+    }
+
+    /// Link a plugin response to its original input before publishing the response header.
+    /// Only an explicit peer Drop cancels the input; ending the writer removes the link.
+    #[doc(hidden)]
+    pub fn cancel_input_on_drop(&self, input: StreamReaderSignal) {
+        // Linking before publishing the header must not introduce a fallible setup phase: a
+        // dropped unpublished writer would send End for a stream the peer has never seen.
+        self.signal.lock_for_cleanup().input_on_drop = Some(input);
+    }
+
+    /// Preserve the call input while this SDK-owned forwarding stream is still being consumed.
+    /// Guard cleanup must not perform transport I/O or reenter the stream manager.
+    #[doc(hidden)]
+    pub fn keep_input_alive(&self, guard: StreamReaderHold) {
+        let previous = self.signal.lock_for_cleanup().input_guard.replace(guard);
+        // A hold has its own bookkeeping lock, so release it outside the writer lock.
+        drop(previous);
+    }
+
+    /// Write a single piece of data to the stream.
+    ///
+    /// Error if something failed with the write, or if [`.end()`](Self::end) was already called
+    /// previously.
+    pub fn write(&mut self, data: impl Into<StreamData>) -> Result<(), ShellError> {
+        if !self.ended {
+            self.writer
+                .write_stream_message(StreamMessage::Data(self.id, data.into()))?;
+            // Flush after each data message to ensure they do predictably appear on the other side
+            // when they're generated
+            //
+            // TODO: make the buffering configurable, as this is a factor for performance
+            self.writer.flush()?;
+            // This implements flow control, so we don't write too many messages:
+            if !self.signal.notify_sent()? {
+                self.signal.wait_for_drain()
+            } else {
+                Ok(())
+            }
+        } else {
+            Err(ShellError::Generic(
+                GenericError::new_internal(
+                    "Wrote to a stream after it ended",
+                    format!(
+                        "tried to write to stream {} after it was already ended",
+                        self.id
+                    ),
+                )
+                .with_help("this may be a bug in the nu-plugin crate"),
+            ))
+        }
+    }
+
+    /// Write a full iterator to the stream. Note that this doesn't end the stream, so you should
+    /// still call [`.end()`](Self::end).
+    ///
+    /// If the stream is dropped from the other end, the iterator will not be fully consumed, and
+    /// writing will terminate.
+    ///
+    /// Returns `Ok(true)` if the iterator was fully consumed, or `Ok(false)` if a drop interrupted
+    /// the stream from the other side.
+    pub fn write_all<T>(&mut self, data: impl IntoIterator<Item = T>) -> Result<bool, ShellError>
+    where
+        T: Into<StreamData>,
+    {
+        // Check before starting
+        if self.is_dropped()? {
+            return Ok(false);
+        }
+
+        for item in data {
+            // Check again after each item is consumed from the iterator, just in case the iterator
+            // takes a while to produce a value
+            if self.is_dropped()? {
+                return Ok(false);
+            }
+            self.write(item)?;
+        }
+        Ok(true)
+    }
+
+    /// End the stream. Recommend doing this instead of relying on `Drop` so that you can catch the
+    /// error.
+    pub fn end(&mut self) -> Result<(), ShellError> {
+        if !self.ended {
+            // Set the flag first so we don't double-report in the Drop
+            self.ended = true;
+            // A Drop acknowledging natural EOF must not cancel input. Serialize unlinking with
+            // peer Drop, which cancels the input before waking this writer.
+            let guard = {
+                let mut state = self.signal.lock_for_cleanup();
+                state.input_on_drop = None;
+                state.input_guard.take()
+            };
+            drop(guard);
+            self.writer
+                .write_stream_message(StreamMessage::End(self.id))?;
+            self.writer.flush()
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl<W> Drop for StreamWriter<W>
+where
+    W: WriteStreamMessage,
+{
+    fn drop(&mut self) {
+        // Make sure we ended the stream
+        if let Err(err) = self.end() {
+            log::warn!("Error while ending stream in Drop for StreamWriter: {err}");
+        }
+    }
+}
+
+/// Stores stream state for a writer, and can be blocked on to wait for messages to be acknowledged.
+/// A key part of managing stream lifecycle and flow control.
+#[derive(Debug)]
+pub struct StreamWriterSignal {
+    mutex: Mutex<StreamWriterSignalState>,
+    change_cond: Condvar,
+}
+
+#[derive(Debug)]
+pub struct StreamWriterSignalState {
+    /// Stream has been dropped and consumer is no longer interested in any messages.
+    dropped: bool,
+    /// Number of messages that have been sent without acknowledgement.
+    unacknowledged: i32,
+    /// Max number of messages to send before waiting for acknowledgement.
+    high_pressure_mark: i32,
+    /// Original call input to cancel when the engine drops a plugin response early.
+    input_on_drop: Option<StreamReaderSignal>,
+    /// Keeps original input readable while an SDK-owned engine-call forwarder is being consumed.
+    input_guard: Option<StreamReaderHold>,
+}
+
+impl StreamWriterSignal {
+    /// Create a new signal.
+    ///
+    /// If `notify_sent()` is called more than `high_pressure_mark` times, it will wait until
+    /// `notify_acknowledge()` is called by another thread enough times to bring the number of
+    /// unacknowledged sent messages below that threshold.
+    fn new(high_pressure_mark: i32) -> StreamWriterSignal {
+        assert!(high_pressure_mark > 0);
+
+        StreamWriterSignal {
+            mutex: Mutex::new(StreamWriterSignalState {
+                dropped: false,
+                unacknowledged: 0,
+                high_pressure_mark,
+                input_on_drop: None,
+                input_guard: None,
+            }),
+            change_cond: Condvar::new(),
+        }
+    }
+
+    fn lock(&self) -> Result<MutexGuard<'_, StreamWriterSignalState>, ShellError> {
+        self.mutex.lock().map_err(|_| ShellError::NushellFailed {
+            msg: "StreamWriterSignal mutex poisoned due to panic".into(),
+        })
+    }
+
+    fn lock_for_cleanup(&self) -> MutexGuard<'_, StreamWriterSignalState> {
+        // Only local associations are changed through this guard. Preserve ordinary flow-control
+        // errors, but don't let poisoning skip setup or the terminal End write.
+        self.mutex.lock().unwrap_or_else(|err| {
+            log::warn!("Recovering poisoned StreamWriterSignal for stream setup or cleanup");
+            err.into_inner()
+        })
+    }
+
+    /// True if the stream was dropped and the consumer is no longer interested in it. Indicates
+    /// that no more messages should be sent, other than `End`.
+    pub fn is_dropped(&self) -> Result<bool, ShellError> {
+        Ok(self.lock()?.dropped)
+    }
+
+    /// Notify the writers that the stream has been dropped, so they can stop writing.
+    pub fn set_dropped(&self) -> Result<(), ShellError> {
+        let mut state = self.lock()?;
+        state.dropped = true;
+        // Unblock the writers so they can terminate
+        self.change_cond.notify_all();
+        Ok(())
+    }
+
+    fn set_dropped_by_peer(&self) -> Result<(), ShellError> {
+        let mut state = self.lock()?;
+        state.dropped = true;
+        if let Some(input) = state.input_on_drop.take() {
+            // This only sets a flag and sends a local, non-blocking notification. Keep the writer
+            // locked until cancellation is published so End cannot unlink the input first.
+            input.cancel_when_released();
+        }
+        let guard = state.input_guard.take();
+        drop(state);
+        // A forwarding consumer is done even if the writer is still blocked on upstream input.
+        // Releasing its guard lets deferred completion cleanup wake that reader. Drop outside the
+        // writer lock because a guard can have its own cleanup locks.
+        drop(guard);
+        self.change_cond.notify_all();
+        Ok(())
+    }
+
+    /// Track that a message has been sent. Returns `Ok(true)` if more messages can be sent,
+    /// or `Ok(false)` if the high pressure mark has been reached and
+    /// [`.wait_for_drain()`](Self::wait_for_drain) should be called to block.
+    pub fn notify_sent(&self) -> Result<bool, ShellError> {
+        let mut state = self.lock()?;
+        state.unacknowledged =
+            state
+                .unacknowledged
+                .checked_add(1)
+                .ok_or_else(|| ShellError::NushellFailed {
+                    msg: "Overflow in counter: too many unacknowledged messages".into(),
+                })?;
+
+        Ok(state.unacknowledged < state.high_pressure_mark)
+    }
+
+    /// Wait for acknowledgements before sending more data. Also returns if the stream is dropped.
+    pub fn wait_for_drain(&self) -> Result<(), ShellError> {
+        let mut state = self.lock()?;
+        while !state.dropped && state.unacknowledged >= state.high_pressure_mark {
+            state = self
+                .change_cond
+                .wait(state)
+                .map_err(|_| ShellError::NushellFailed {
+                    msg: "StreamWriterSignal mutex poisoned due to panic".into(),
+                })?;
+        }
+        Ok(())
+    }
+
+    /// Notify the writers that a message has been acknowledged, so they can continue to write
+    /// if they were waiting.
+    pub fn notify_acknowledged(&self) -> Result<(), ShellError> {
+        let mut state = self.lock()?;
+        state.unacknowledged =
+            state
+                .unacknowledged
+                .checked_sub(1)
+                .ok_or_else(|| ShellError::NushellFailed {
+                    msg: "Underflow in counter: too many message acknowledgements".into(),
+                })?;
+        // Unblock the writer
+        self.change_cond.notify_one();
+        Ok(())
+    }
+}
+
+/// A sink for a [`StreamMessage`]
+pub trait WriteStreamMessage {
+    fn write_stream_message(&mut self, msg: StreamMessage) -> Result<(), ShellError>;
+    fn flush(&mut self) -> Result<(), ShellError>;
+}
+
+#[derive(Debug, Default)]
+struct StreamManagerState {
+    reading_streams: BTreeMap<StreamId, Arc<mpsc::Sender<ReaderMessage>>>,
+    writing_streams: BTreeMap<StreamId, Weak<StreamWriterSignal>>,
+}
+
+impl StreamManagerState {
+    /// Lock the state, or return a [`ShellError`] if the mutex is poisoned.
+    fn lock(
+        state: &Mutex<StreamManagerState>,
+    ) -> Result<MutexGuard<'_, StreamManagerState>, ShellError> {
+        state.lock().map_err(|_| ShellError::NushellFailed {
+            msg: "StreamManagerState mutex poisoned due to a panic".into(),
+        })
+    }
+}
+
+#[derive(Debug)]
+pub struct StreamManager {
+    state: Arc<Mutex<StreamManagerState>>,
+}
+
+impl StreamManager {
+    /// Create a new StreamManager.
+    pub fn new() -> StreamManager {
+        StreamManager {
+            state: Default::default(),
+        }
+    }
+
+    fn lock(&self) -> Result<MutexGuard<'_, StreamManagerState>, ShellError> {
+        StreamManagerState::lock(&self.state)
+    }
+
+    /// Create a new handle to the StreamManager for registering streams.
+    pub fn get_handle(&self) -> StreamManagerHandle {
+        StreamManagerHandle {
+            state: Arc::downgrade(&self.state),
+        }
+    }
+
+    /// Process a stream message, and update internal state accordingly.
+    pub fn handle_message(&self, message: StreamMessage) -> Result<(), ShellError> {
+        let mut state = self.lock()?;
+        match message {
+            StreamMessage::Data(id, data) => {
+                if let Some(sender) = state.reading_streams.get(&id) {
+                    // We should ignore the error on send. This just means the reader has dropped,
+                    // but it will have sent a Drop message to the other side, and we will receive
+                    // an End message at which point we can remove the channel.
+                    let _ = sender.send(ReaderMessage::Incoming(Ok(Some(data))));
+                    Ok(())
+                } else {
+                    Err(ShellError::PluginFailedToDecode {
+                        msg: format!("received Data for unknown stream {id}"),
+                    })
+                }
+            }
+            StreamMessage::End(id) => {
+                if let Some(sender) = state.reading_streams.remove(&id) {
+                    // We should ignore the error on the send, because the reader might have dropped
+                    // already
+                    let _ = sender.send(ReaderMessage::Incoming(Ok(None)));
+                    Ok(())
+                } else {
+                    Err(ShellError::PluginFailedToDecode {
+                        msg: format!("received End for unknown stream {id}"),
+                    })
+                }
+            }
+            StreamMessage::Drop(id) => {
+                if let Some(signal) = state.writing_streams.remove(&id)
+                    && let Some(signal) = signal.upgrade()
+                {
+                    // This will wake blocked writers so they can stop writing, so it's ok
+                    signal.set_dropped_by_peer()?;
+                }
+                // It's possible that the stream has already finished writing and we don't have it
+                // anymore, so we fall through to Ok
+                Ok(())
+            }
+            StreamMessage::Ack(id) => {
+                if let Some(signal) = state.writing_streams.get(&id) {
+                    if let Some(signal) = signal.upgrade() {
+                        // This will wake up a blocked writer
+                        signal.notify_acknowledged()?;
+                    } else {
+                        // We know it doesn't exist, so might as well remove it
+                        state.writing_streams.remove(&id);
+                    }
+                }
+                // It's possible that the stream has already finished writing and we don't have it
+                // anymore, so we fall through to Ok
+                Ok(())
+            }
+        }
+    }
+
+    /// Broadcast an error to all stream readers. This is useful for error propagation.
+    pub fn broadcast_read_error(&self, error: ShellError) -> Result<(), ShellError> {
+        let state = self.lock()?;
+        for channel in state.reading_streams.values() {
+            // Ignore send errors.
+            let _ = channel.send(ReaderMessage::Incoming(Err(error.clone())));
+        }
+        Ok(())
+    }
+
+    // If the `StreamManager` is dropped, we should let all of the stream writers know that they
+    // won't be able to write anymore. We don't need to do anything about the readers though
+    // because they'll know when the `Sender` is dropped automatically
+    fn drop_all_writers(&self) -> Result<(), ShellError> {
+        let mut state = self.lock()?;
+        let writers = std::mem::take(&mut state.writing_streams);
+        for (_, signal) in writers {
+            if let Some(signal) = signal.upgrade() {
+                // more important that we send to all than handling an error
+                let _ = signal.set_dropped();
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Default for StreamManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for StreamManager {
+    fn drop(&mut self) {
+        if let Err(err) = self.drop_all_writers() {
+            log::warn!("error during Drop for StreamManager: {err}")
+        }
+    }
+}
+
+/// A [`StreamManagerHandle`] supports operations for interacting with the [`StreamManager`].
+///
+/// Streams can be registered for reading, returning a [`StreamReader`], or for writing, returning
+/// a [`StreamWriter`].
+#[derive(Debug, Clone)]
+pub struct StreamManagerHandle {
+    state: Weak<Mutex<StreamManagerState>>,
+}
+
+impl StreamManagerHandle {
+    /// Because the handle only has a weak reference to the [`StreamManager`] state, we have to
+    /// first try to upgrade to a strong reference and then lock. This function wraps those two
+    /// operations together, handling errors appropriately.
+    fn with_lock<T, F>(&self, f: F) -> Result<T, ShellError>
+    where
+        F: FnOnce(MutexGuard<StreamManagerState>) -> Result<T, ShellError>,
+    {
+        let upgraded = self
+            .state
+            .upgrade()
+            .ok_or_else(|| ShellError::NushellFailed {
+                msg: "StreamManager is no longer alive".into(),
+            })?;
+        let guard = upgraded.lock().map_err(|_| ShellError::NushellFailed {
+            msg: "StreamManagerState mutex poisoned due to a panic".into(),
+        })?;
+        f(guard)
+    }
+
+    /// Register a new stream for reading, and return a [`StreamReader`] that can be used to iterate
+    /// on the values received. A [`StreamMessage`] writer is required for writing control messages
+    /// back to the producer.
+    pub fn read_stream<T, W>(
+        &self,
+        id: StreamId,
+        writer: W,
+    ) -> Result<StreamReader<T, W>, ShellError>
+    where
+        T: TryFrom<StreamData, Error = ShellError>,
+        W: WriteStreamMessage,
+    {
+        let (tx, rx) = mpsc::channel();
+        let tx = Arc::new(tx);
+        let cancellation = StreamReaderSignal::new(&tx);
+        self.with_lock(|mut state| {
+            // Must be exclusive
+            if let btree_map::Entry::Vacant(e) = state.reading_streams.entry(id) {
+                e.insert(tx);
+                Ok(())
+            } else {
+                Err(ShellError::Generic(
+                    GenericError::new_internal(
+                        format!("Failed to acquire reader for stream {id}"),
+                        "tried to get a reader for a stream that's already being read",
+                    )
+                    .with_help("this may be a bug in the nu-plugin crate"),
+                ))
+            }
+        })?;
+        Ok(StreamReader::new(id, rx, writer, cancellation))
+    }
+
+    /// Register a new stream for writing, and return a [`StreamWriter`] that can be used to send
+    /// data to the stream.
+    ///
+    /// The `high_pressure_mark` value controls how many messages can be written without receiving
+    /// an acknowledgement before any further attempts to write will wait for the consumer to
+    /// acknowledge them. This prevents overwhelming the reader.
+    pub fn write_stream<W>(
+        &self,
+        id: StreamId,
+        writer: W,
+        high_pressure_mark: i32,
+    ) -> Result<StreamWriter<W>, ShellError>
+    where
+        W: WriteStreamMessage,
+    {
+        let signal = Arc::new(StreamWriterSignal::new(high_pressure_mark));
+        self.with_lock(|mut state| {
+            // Remove dead writing streams
+            state
+                .writing_streams
+                .retain(|_, signal| signal.strong_count() > 0);
+            // Must be exclusive
+            if let btree_map::Entry::Vacant(e) = state.writing_streams.entry(id) {
+                e.insert(Arc::downgrade(&signal));
+                Ok(())
+            } else {
+                Err(ShellError::Generic(
+                    GenericError::new_internal(
+                        format!("Failed to acquire writer for stream {id}"),
+                        "tried to get a writer for a stream that's already being written",
+                    )
+                    .with_help("this may be a bug in the nu-plugin crate"),
+                ))
+            }
+        })?;
+        Ok(StreamWriter::new(id, signal, writer))
+    }
+}
