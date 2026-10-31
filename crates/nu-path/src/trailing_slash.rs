@@ -6,7 +6,7 @@ use std::{
 /// Strip any trailing slashes from a non-root path. This is required in some contexts, for example
 /// for the `PWD` environment variable.
 pub fn strip_trailing_slash(path: &Path) -> Cow<'_, Path> {
-    if has_trailing_slash(path) {
+    if has_trailing_slash(path) && path.is_dir() {
         // If there are, the safest thing to do is have Rust parse the path for us and build it
         // again. This will correctly handle a root directory, but it won't add the trailing slash.
         let mut out = PathBuf::with_capacity(path.as_os_str().len());
