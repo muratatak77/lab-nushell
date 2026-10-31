@@ -33,7 +33,7 @@ pub fn has_trailing_slash(path: &Path) -> bool {
     use std::os::unix::ffi::OsStrExt;
 
     let last = path.as_os_str().as_bytes().last();
-    last == Some(&b'/')
+    last == Some(&b'\\')
 }
 
 /// `true` if the path has a trailing slash, including if it's the root directory.
