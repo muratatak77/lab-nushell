@@ -105,12 +105,12 @@ Commands matching any of the regexes in `$env.config.history.ignore_patterns` ar
                     &engine_state.config_dirs.config_home,
                     call.head,
                 )?;
-                let mut dst = ignore.wrap(new_backend(
+                let mut dst = new_backend(
                     history.file_format,
                     Some(current_history_path),
                     &engine_state.config_dirs.config_home,
                     call.head,
-                )?);
+                )?;
                 let items = src
                     .search(SearchQuery::everything(
                         reedline::SearchDirection::Forward,
@@ -119,20 +119,20 @@ Commands matching any of the regexes in `$env.config.history.ignore_patterns` ar
                     .map_err(error_from_reedline)?
                     .into_iter()
                     .map(Ok);
-                import(dst.as_mut(), items)
+                import(dst.as_mut(), items, &ignore)
             }
             _ => {
                 let input = input.into_iter().map(item_from_value);
                 import(
-                    ignore
-                        .wrap(new_backend(
-                            history.file_format,
-                            Some(current_history_path),
-                            &engine_state.config_dirs.config_home,
-                            call.head,
-                        )?)
-                        .as_mut(),
+                    new_backend(
+                        history.file_format,
+                        Some(current_history_path),
+                        &engine_state.config_dirs.config_home,
+                        call.head,
+                    )?
+                    .as_mut(),
                     input,
+                    &ignore,
                 )
             }
         }?;
@@ -173,12 +173,17 @@ fn new_backend(
     }
 }
 
+/// Save every item of `src` to `dst` as a new entry, skipping those matched by `ignore`.
 fn import(
     dst: &mut dyn History,
     src: impl Iterator<Item = Result<HistoryItem, ShellError>>,
+    ignore: &HistoryIgnore,
 ) -> Result<(), ShellError> {
     for item in src {
         let mut item = item?;
+        if ignore.is_ignored(&item.command_line) {
+            continue;
+        }
         item.id = None;
         dst.save(item).map_err(error_from_reedline)?;
     }

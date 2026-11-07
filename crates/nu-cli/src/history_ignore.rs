@@ -1,7 +1,7 @@
 //! Keep commands matching `$env.config.history.ignore_patterns` out of the history file.
 //!
 //! Reedline only knows how to exclude lines starting with a fixed prefix, so the regex based
-//! filtering lives in [`IgnoringHistory`], a thin [`History`] wrapper that drops new entries
+//! filtering lives in [`IgnoringHistory`], a thin [`History`] wrapper that refuses new entries
 //! before they reach the real backend. The active patterns are held by a [`HistoryIgnore`]
 //! handle that the REPL refreshes every prompt, so changing the config at runtime takes effect
 //! on the next command without rebuilding the line editor.
@@ -10,7 +10,8 @@ use fancy_regex::Regex;
 use log::warn;
 use nu_protocol::engine::EngineState;
 use reedline::{
-    History, HistoryItem, HistoryItemId, HistorySessionId, Result as ReedlineResult, SearchQuery,
+    History, HistoryItem, HistoryItemId, HistorySessionId, ReedlineError, ReedlineErrorVariants,
+    Result as ReedlineResult, SearchQuery,
 };
 use std::sync::{Arc, PoisonError, RwLock};
 
@@ -41,7 +42,8 @@ impl HistoryIgnore {
     /// Replace the active patterns with `sources`, unless they are unchanged.
     ///
     /// The config layer rejects invalid regexes, so a compile failure here is unexpected; such a
-    /// pattern is logged and skipped rather than stopping the REPL.
+    /// pattern is logged and skipped rather than stopping the REPL. The log names the pattern by
+    /// its index only: patterns often describe secrets, and the compile error can quote them.
     pub(crate) fn update(&self, engine_state: &EngineState, sources: &[String]) {
         if self
             .patterns
@@ -55,13 +57,16 @@ impl HistoryIgnore {
 
         let regexes = sources
             .iter()
-            .filter_map(|pattern| match engine_state.get_cached_regex(pattern) {
-                Ok(regex) => Some(regex),
-                Err(err) => {
-                    warn!("Ignoring invalid history ignore pattern '{pattern}': {err}");
-                    None
-                }
-            })
+            .enumerate()
+            .filter_map(
+                |(index, pattern)| match engine_state.get_cached_regex(pattern) {
+                    Ok(regex) => Some(regex),
+                    Err(_) => {
+                        warn!("Ignoring invalid regex in history.ignore_patterns[{index}]");
+                        None
+                    }
+                },
+            )
             .collect();
 
         *self
@@ -87,6 +92,9 @@ impl HistoryIgnore {
     }
 
     /// Wrap `history` so new entries matching the active patterns are not saved.
+    ///
+    /// The wrapper refuses ignored entries with an error (see [`IgnoringHistory`]), so callers
+    /// that save in bulk, like `history import`, should skip them with [`Self::is_ignored`].
     pub(crate) fn wrap(&self, history: Box<dyn History>) -> Box<dyn History> {
         Box::new(IgnoringHistory {
             inner: history,
@@ -95,11 +103,17 @@ impl HistoryIgnore {
     }
 }
 
-/// A [`History`] backend that silently drops new entries matched by a [`HistoryIgnore`].
+/// A [`History`] backend that refuses new entries matched by a [`HistoryIgnore`].
 ///
-/// Dropped entries are returned without an id, which is how reedline's own backends report
-/// "not stored" (e.g. for duplicate lines). Reedline then has no last command to attach
-/// metadata such as the exit status to, so nothing about the command reaches the backend.
+/// Refused entries return [`IGNORED_ERROR`]. Reedline treats a failed save as "ran but not
+/// stored", the same state as a line excluded by `history.ignore_space_prefixed`: the line can
+/// still be recalled with Up on the next prompt, and its metadata (exit status, duration, ...)
+/// only updates that in-memory copy, so nothing about the command reaches the backend.
+/// Returning the item without an id instead would make reedline forget the line at once.
+/// Reedline stashes the error for `take_history_save_error`, which nu does not report.
+const IGNORED_ERROR: ReedlineErrorVariants =
+    ReedlineErrorVariants::OtherHistoryError("entry matches history.ignore_patterns");
+
 struct IgnoringHistory {
     inner: Box<dyn History>,
     ignore: HistoryIgnore,
@@ -109,7 +123,7 @@ impl History for IgnoringHistory {
     fn save(&mut self, h: HistoryItem) -> ReedlineResult<HistoryItem> {
         // Items with an id are updates of entries that were already accepted.
         if h.id.is_none() && self.ignore.is_ignored(&h.command_line) {
-            return Ok(h);
+            return Err(ReedlineError(IGNORED_ERROR));
         }
         self.inner.save(h)
     }
@@ -215,13 +229,36 @@ mod tests {
         let mut history = ignore.wrap(Box::new(FileBackedHistory::new(100).unwrap()));
 
         let kept = history.save(HistoryItem::from_command_line("ls")).unwrap();
-        let dropped = history
-            .save(HistoryItem::from_command_line("set PASSWORD hunter2"))
-            .unwrap();
+        let dropped = history.save(HistoryItem::from_command_line("set PASSWORD hunter2"));
 
         assert!(kept.id.is_some());
-        assert!(dropped.id.is_none());
+        // An error is what makes reedline keep the line recallable, like a space-prefixed one.
+        assert!(matches!(
+            dropped,
+            Err(ReedlineError(ReedlineErrorVariants::OtherHistoryError(_)))
+        ));
         assert_eq!(saved_commands(history.as_ref()), vec!["ls".to_string()]);
+    }
+
+    #[test]
+    fn wrapped_history_keeps_updates_of_stored_items() {
+        let engine_state = EngineState::new();
+        let ignore = HistoryIgnore::default();
+        let mut history = ignore.wrap(Box::new(FileBackedHistory::new(100).unwrap()));
+
+        let stored = history.save(HistoryItem::from_command_line("ls")).unwrap();
+        assert!(stored.id.is_some());
+        history.save(HistoryItem::from_command_line("pwd")).unwrap();
+
+        // The entry was accepted before the pattern existed, so a save carrying its id must
+        // still reach the inner backend even though it now matches.
+        ignore.update(&engine_state, &patterns(&["^ls$"]));
+        assert!(history.save(stored).is_ok());
+
+        assert_eq!(
+            saved_commands(history.as_ref()),
+            vec!["ls".to_string(), "pwd".to_string(), "ls".to_string()]
+        );
     }
 
     #[test]
@@ -232,7 +269,7 @@ mod tests {
 
         history.save(HistoryItem::from_command_line("ls")).unwrap();
         ignore.update(&engine_state, &patterns(&["^ls$"]));
-        history.save(HistoryItem::from_command_line("ls")).unwrap();
+        assert!(history.save(HistoryItem::from_command_line("ls")).is_err());
         history.save(HistoryItem::from_command_line("pwd")).unwrap();
 
         assert_eq!(
