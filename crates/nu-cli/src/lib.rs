@@ -7,6 +7,7 @@ mod config_files;
 mod eval_cmds;
 mod eval_file;
 mod hints;
+mod history_dedupe;
 mod menus;
 mod prompt;
 mod prompt_update;
@@ -25,6 +26,7 @@ pub use completions::{
 pub use config_files::{eval_config_contents, eval_config_contents_with_kind};
 pub use eval_cmds::{EvaluateCommandsOpts, evaluate_commands};
 pub use eval_file::evaluate_file;
+pub use history_dedupe::DedupingHistory;
 pub use menus::NuHelpCompleter;
 pub use prompt::NushellPrompt;
 pub use prompt_update::update_prompt;
