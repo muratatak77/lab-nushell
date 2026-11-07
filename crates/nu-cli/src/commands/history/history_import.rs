@@ -11,6 +11,7 @@ use reedline::{
 };
 
 use super::fields;
+use crate::history_ignore::HistoryIgnore;
 
 #[derive(Clone)]
 pub struct HistoryImport;
@@ -30,7 +31,9 @@ impl Command for HistoryImport {
 
 If no input is provided, will import all history items from existing history in the other format: if current history is stored in sqlite, it will store it in plain text and vice versa.
 
-Note that history item IDs are ignored when importing from file."
+Note that history item IDs are ignored when importing from file.
+
+Commands matching any of the regexes in `$env.config.history.ignore_patterns` are skipped, just like they are when typed at the prompt."
     }
 
     fn signature(&self) -> nu_protocol::Signature {
@@ -84,6 +87,7 @@ Note that history item IDs are ignored when importing from file."
         if let Some(bak_path) = backup(&current_history_path, span)? {
             println!("Backed history to {}", bak_path.display());
         }
+        let ignore = HistoryIgnore::new(engine_state, &history.ignore_patterns);
         match input {
             PipelineData::Empty => {
                 let other_format = match history.file_format {
@@ -96,12 +100,12 @@ Note that history item IDs are ignored when importing from file."
                     &engine_state.config_dirs.config_home,
                     call.head,
                 )?;
-                let mut dst = new_backend(
+                let mut dst = ignore.wrap(new_backend(
                     history.file_format,
                     Some(current_history_path),
                     &engine_state.config_dirs.config_home,
                     call.head,
-                )?;
+                )?);
                 let items = src
                     .search(SearchQuery::everything(
                         reedline::SearchDirection::Forward,
@@ -115,13 +119,14 @@ Note that history item IDs are ignored when importing from file."
             _ => {
                 let input = input.into_iter().map(item_from_value);
                 import(
-                    new_backend(
-                        history.file_format,
-                        Some(current_history_path),
-                        &engine_state.config_dirs.config_home,
-                        call.head,
-                    )?
-                    .as_mut(),
+                    ignore
+                        .wrap(new_backend(
+                            history.file_format,
+                            Some(current_history_path),
+                            &engine_state.config_dirs.config_home,
+                            call.head,
+                        )?)
+                        .as_mut(),
                     input,
                 )
             }

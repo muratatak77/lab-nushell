@@ -66,6 +66,12 @@ pub struct HistoryConfig {
     pub isolation: bool,
     pub path: HistoryPath,
     pub ignore_space_prefixed: bool,
+    /// Regular expressions for commands that should not be saved to history.
+    ///
+    /// A command is left out of the history file if any pattern matches anywhere in its text.
+    /// Every entry has been validated as a regex by [`UpdateFromValue`], so consumers may compile
+    /// them without re-reporting errors to the user.
+    pub ignore_patterns: Vec<String>,
 }
 
 impl IntoValue for HistoryPath {
@@ -88,6 +94,7 @@ impl IntoValue for HistoryConfig {
                 "isolation" => self.isolation.into_value(span),
                 "path" => self.path.into_value(span),
                 "ignore_space_prefixed" => self.ignore_space_prefixed.into_value(span),
+                "ignore_patterns" => self.ignore_patterns.into_value(span),
             },
             span,
         )
@@ -125,6 +132,43 @@ impl HistoryConfig {
 
         Some(path)
     }
+
+    /// Replace [`Self::ignore_patterns`] with the list of regexes in `value`.
+    ///
+    /// Each element must be a string holding a valid regular expression. If any element is
+    /// rejected, the previous patterns are kept so a typo does not silently start recording
+    /// commands the user meant to keep out of history.
+    fn update_ignore_patterns<'a>(
+        &mut self,
+        value: &'a Value,
+        path: &mut ConfigPath<'a>,
+        errors: &mut ConfigErrors,
+    ) {
+        let Value::List { vals, .. } = value else {
+            errors.type_mismatch(path, Type::list(Type::String), value);
+            return;
+        };
+
+        let mut patterns = Vec::with_capacity(vals.len());
+        let mut valid = true;
+        for item in vals {
+            let Ok(pattern) = item.as_str() else {
+                errors.type_mismatch(path, Type::String, item);
+                valid = false;
+                continue;
+            };
+            if let Err(err) = fancy_regex::Regex::new(pattern) {
+                errors.invalid_value(path, format!("a valid regular expression ({err})"), item);
+                valid = false;
+                continue;
+            }
+            patterns.push(pattern.to_owned());
+        }
+
+        if valid {
+            self.ignore_patterns = patterns;
+        }
+    }
 }
 
 impl Default for HistoryConfig {
@@ -136,6 +180,7 @@ impl Default for HistoryConfig {
             isolation: false,
             path: HistoryPath::Default,
             ignore_space_prefixed: true,
+            ignore_patterns: Vec::new(),
         }
     }
 }
@@ -223,6 +268,7 @@ impl UpdateFromValue for HistoryConfig {
                     }
                 },
                 "ignore_space_prefixed" => self.ignore_space_prefixed.update(val, path, errors),
+                "ignore_patterns" => self.update_ignore_patterns(val, path, errors),
                 _ => errors.unknown_option(path, val),
             }
         }
@@ -468,5 +514,102 @@ mod tests {
         assert_eq!(new.history.max_size, new_max_size);
         assert_eq!(new.history.file_format, new_file_format);
         assert_eq!(new.history.isolation, new_isolation);
+    }
+
+    fn ignore_patterns_record(patterns: Value) -> Value {
+        Value::test_record(record! {
+            "history" => Value::test_record(record! {
+                "ignore_patterns" => patterns,
+            }),
+        })
+    }
+
+    #[test]
+    fn ignore_patterns_default_to_empty() {
+        assert!(Config::default().history.ignore_patterns.is_empty());
+    }
+
+    #[test]
+    fn ignore_patterns_accept_list_of_regexes() {
+        let old = Config::default();
+        let mut new = old.clone();
+        let value = ignore_patterns_record(Value::test_list(vec![
+            Value::test_string("^ls$"),
+            Value::test_string("(?i)password|token"),
+        ]));
+
+        let result = new.update_from_value_with_options(&old, &value, true);
+
+        assert!(
+            result.is_ok(),
+            "valid patterns should be accepted: {result:?}"
+        );
+        assert_eq!(
+            new.history.ignore_patterns,
+            vec!["^ls$".to_string(), "(?i)password|token".to_string()]
+        );
+    }
+
+    #[test]
+    fn ignore_patterns_round_trip_through_value() {
+        let mut config = Config::default();
+        config.history.ignore_patterns = vec!["^exit$".into()];
+
+        let value = config.history.into_value(Span::test_data());
+        let patterns = value
+            .get_data_by_key("ignore_patterns")
+            .expect("ignore_patterns should be part of the history record");
+
+        assert_eq!(
+            patterns,
+            Value::test_list(vec![Value::test_string("^exit$")])
+        );
+    }
+
+    #[test]
+    fn ignore_patterns_reject_invalid_regex_and_keep_previous() {
+        let mut old = Config::default();
+        old.history.ignore_patterns = vec!["^ls$".into()];
+        let mut new = old.clone();
+        let value = ignore_patterns_record(Value::test_list(vec![
+            Value::test_string("^cd"),
+            Value::test_string("(unclosed"),
+        ]));
+
+        let result = new.update_from_value_with_options(&old, &value, false);
+
+        let err = result.expect_err("an invalid regex should be rejected");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("InvalidValue") && msg.contains("ignore_patterns"),
+            "expected InvalidValue error for ignore_patterns, got: {msg}",
+        );
+        assert_eq!(new.history.ignore_patterns, vec!["^ls$".to_string()]);
+    }
+
+    #[test]
+    fn ignore_patterns_reject_non_string_elements() {
+        let old = Config::default();
+        let mut new = old.clone();
+        let value = ignore_patterns_record(Value::test_list(vec![Value::test_int(1)]));
+
+        let result = new.update_from_value_with_options(&old, &value, false);
+
+        let err = result.expect_err("non-string patterns should be rejected");
+        assert!(format!("{err:?}").contains("TypeMismatch"));
+        assert!(new.history.ignore_patterns.is_empty());
+    }
+
+    #[test]
+    fn ignore_patterns_reject_non_list() {
+        let old = Config::default();
+        let mut new = old.clone();
+        let value = ignore_patterns_record(Value::test_string("^ls$"));
+
+        let result = new.update_from_value_with_options(&old, &value, false);
+
+        let err = result.expect_err("a bare string should be rejected");
+        assert!(format!("{err:?}").contains("TypeMismatch"));
+        assert!(new.history.ignore_patterns.is_empty());
     }
 }

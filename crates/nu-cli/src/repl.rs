@@ -9,6 +9,7 @@ use crate::{
     NuHighlighter, NuValidator, NushellPrompt,
     completions::{NarrowingCache, NuCompleter, flush_completion_warnings},
     hints::ExternalHinter,
+    history_ignore::HistoryIgnore,
     prompt_update,
     reedline_config::{KeybindingsMode, add_menus, create_keybindings},
     syntax_highlight::NoOpHighlighter,
@@ -127,6 +128,8 @@ pub fn evaluate_repl(
     unique_stack.set_last_exit_code(0, Span::unknown());
 
     let temp_file = temp_dir().join(format!("{}.nu", uuid::Uuid::new_v4()));
+    // Shared with the history backend, so it outlives line editors rebuilt after a panic.
+    let history_ignore = HistoryIgnore::default();
 
     if let Some(s) = prerun_command {
         eval_source(
@@ -153,7 +156,7 @@ pub fn evaluate_repl(
     // Build reedline after the optional prerun command so ANSI coloring and the other
     // editor settings a `--execute`-sourced config changes are picked up for the
     // session. Menus and keybindings additionally refresh every prompt iteration.
-    let mut line_editor = get_line_editor(engine_state, use_color)?;
+    let mut line_editor = get_line_editor(engine_state, use_color, &history_ignore)?;
 
     confirm_stdin_is_terminal()?;
 
@@ -242,6 +245,7 @@ pub fn evaluate_repl(
                 is_hostcommand: &mut is_hostcommand,
                 completion_cache: current_completion_cache,
                 first_prompt: first_prompt.take(),
+                history_ignore: &history_ignore,
             });
 
             // pass the most recent version of the line_editor back
@@ -277,7 +281,7 @@ pub fn evaluate_repl(
             }
             Err(_) => {
                 // line_editor is lost in the error case so reconstruct a new one
-                line_editor = get_line_editor(engine_state, use_color)?;
+                line_editor = get_line_editor(engine_state, use_color, &history_ignore)?;
             }
         }
     }
@@ -323,7 +327,11 @@ fn escape_special_vscode_bytes(input: &str) -> Result<String, ShellError> {
     })
 }
 
-fn get_line_editor(engine_state: &mut EngineState, use_color: bool) -> Result<Reedline> {
+fn get_line_editor(
+    engine_state: &mut EngineState,
+    use_color: bool,
+    history_ignore: &HistoryIgnore,
+) -> Result<Reedline> {
     let mut start_time = Instant::now();
     let mut line_editor = Reedline::create();
 
@@ -334,7 +342,7 @@ fn get_line_editor(engine_state: &mut EngineState, use_color: bool) -> Result<Re
     if let Some(history) = engine_state.history_config() {
         start_time = Instant::now();
 
-        line_editor = setup_history(engine_state, line_editor, history)?;
+        line_editor = setup_history(engine_state, line_editor, history, history_ignore)?;
 
         // Lock the startup-only `$env.config.history.*` options (`path`, `max_size`,
         // `file_format`, `isolation`) against further changes. Reedline owns the history
@@ -360,6 +368,8 @@ struct LoopContext<'a> {
     completion_cache: NarrowingCache,
     /// Set for the iteration that draws the first prompt; `None` afterwards.
     first_prompt: Option<FirstPrompt>,
+    /// Patterns the history backend consults before saving a command.
+    history_ignore: &'a HistoryIgnore,
 }
 
 /// Work deferred until the REPL is about to draw its first prompt.
@@ -647,6 +657,7 @@ fn loop_iteration(ctx: LoopContext) -> (bool, Stack, Reedline) {
         is_hostcommand,
         completion_cache,
         first_prompt,
+        history_ignore,
     } = ctx;
 
     let mut start_time = Instant::now();
@@ -832,6 +843,7 @@ fn loop_iteration(ctx: LoopContext) -> (bool, Stack, Reedline) {
 
         line_editor = line_editor
             .with_history_exclusion_prefix(history.ignore_space_prefixed.then_some(" ".into()));
+        history_ignore.update(engine_state, &history.ignore_patterns);
 
         if history.sync_on_enter
             && let Err(e) = line_editor.sync_history()
@@ -1416,6 +1428,7 @@ fn setup_history(
     engine_state: &mut EngineState,
     line_editor: Reedline,
     history: HistoryConfig,
+    history_ignore: &HistoryIgnore,
 ) -> Result<Reedline> {
     // Setup history_isolation aka "history per session"
     let history_session_id = if history.isolation {
@@ -1431,6 +1444,7 @@ fn setup_history(
             history,
             line_editor,
             history_session_id,
+            history_ignore,
         );
     };
     Ok(line_editor)
@@ -1527,8 +1541,10 @@ fn update_line_editor_history(
     history: HistoryConfig,
     line_editor: Reedline,
     history_session_id: Option<HistorySessionId>,
+    history_ignore: &HistoryIgnore,
 ) -> Result<Reedline, ErrReport> {
     let ignore_space_prefixed = history.ignore_space_prefixed;
+    history_ignore.update(engine_state, &history.ignore_patterns);
     // History open failures must not abort the REPL (e.g. broken symlink after a
     // moved dotfiles repo). Prefer starting without history over locking the user out.
     let history_backend: Option<Box<dyn reedline::History>> = match history.file_format {
@@ -1570,7 +1586,7 @@ fn update_line_editor_history(
         .with_history_exclusion_prefix(ignore_space_prefixed.then_some(" ".into()));
 
     if let Some(history) = history_backend {
-        line_editor = line_editor.with_history(history);
+        line_editor = line_editor.with_history(history_ignore.wrap(history));
     }
 
     store_history_id_in_engine(engine_state, &line_editor);
@@ -1993,6 +2009,7 @@ fn are_session_ids_in_sync() {
         history,
         line_editor,
         history_session_id,
+        &HistoryIgnore::default(),
     );
     assert_eq!(
         i64::from(line_editor.unwrap().get_history_session_id().unwrap()),
@@ -2021,6 +2038,7 @@ fn dangling_history_symlink_does_not_fail_setup() {
         history,
         line_editor,
         history_session_id,
+        &HistoryIgnore::default(),
     );
     assert!(
         result.is_ok(),

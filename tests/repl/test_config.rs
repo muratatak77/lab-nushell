@@ -201,6 +201,35 @@ fn mutate_nu_config_history_warning() -> TestResult {
 }
 
 #[test]
+fn mutate_nu_config_history_ignore_patterns() -> TestResult {
+    run_test_std(
+        "$env.config.history.ignore_patterns = ['^ls$' '(?i)secret']; $env.config.history.ignore_patterns | to nuon",
+        r#"["^ls$", "(?i)secret"]"#,
+    )
+}
+
+#[test]
+fn mutate_nu_config_history_ignore_patterns_default() -> TestResult {
+    run_test_std("$env.config.history.ignore_patterns | is-empty", "true")
+}
+
+#[test]
+fn mutate_nu_config_history_ignore_patterns_invalid_regex() -> TestResult {
+    fail_test(
+        "$env.config.history.ignore_patterns = ['(unclosed']",
+        "a valid regular expression",
+    )
+}
+
+#[test]
+fn mutate_nu_config_history_ignore_patterns_not_a_list() -> TestResult {
+    fail_test(
+        "$env.config.history.ignore_patterns = '^ls$'",
+        "list<string>",
+    )
+}
+
+#[test]
 fn mutate_nu_config_history_ignore_space() -> TestResult {
     run_test_std(
         "$env.config.history.ignore_space_prefixed = false; $env.config.history.ignore_space_prefixed",

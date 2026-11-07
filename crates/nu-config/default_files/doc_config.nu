@@ -94,6 +94,19 @@ $env.config.history.path = "~/custom/my-history.txt"
 # Default: true
 $env.config.history.ignore_space_prefixed = true
 
+# history.ignore_patterns (list<string>): Regular expressions for commands that should not be
+# saved to history. A command is skipped if any pattern matches anywhere in its text, so use
+# `^` and `$` to match the whole command line. Matching is case-sensitive unless the pattern
+# starts with `(?i)`. Invalid regexes are reported as config errors.
+# Unlike most history settings, this can be changed at any time and applies from the next command.
+# `history import` skips matching commands as well.
+# Patterns passed with `nu --history-ignore <regex>` are appended to this list at startup.
+# Default: []
+# Examples:
+# Don't record trivial navigation and commands that mention secrets:
+# $env.config.history.ignore_patterns = ['^(ls|cd|pwd|exit)$' '(?i)(password|token|secret)']
+$env.config.history.ignore_patterns = []
+
 # ----------------------
 # Miscellaneous Settings
 # ----------------------

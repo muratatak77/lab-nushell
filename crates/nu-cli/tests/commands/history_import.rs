@@ -11,6 +11,7 @@ use rstest::rstest;
 
 trait NuTesterHistoryExt {
     fn with_history(self, config_home: impl AsRef<Path>, format: HistoryFileFormat) -> Self;
+    fn with_history_ignore_patterns(self, patterns: &[&str]) -> Self;
 }
 
 impl NuTesterHistoryExt for NuTester {
@@ -27,6 +28,13 @@ impl NuTesterHistoryExt for NuTester {
             ..Default::default()
         });
         self.engine_state.generate_nu_constant();
+        self
+    }
+
+    fn with_history_ignore_patterns(mut self, patterns: &[&str]) -> Self {
+        let mut config = self.engine_state.get_config().as_ref().clone();
+        config.history.ignore_patterns = patterns.iter().map(|p| p.to_string()).collect();
+        self.engine_state.set_config(config);
         self
     }
 }
@@ -285,6 +293,57 @@ fn to_existing(#[case] dst_format: HistoryFileFormat) -> Result {
 
         assert_eq!(commands_only(&got), commands_only(&want_history));
         assert_eq!(got, want_history);
+        Ok(())
+    })
+}
+
+#[test]
+fn history_import_pipe_skips_ignored() -> Result {
+    Playground::setup("history_import_pipe_skips_ignored", |dirs, _| {
+        let config_home = dirs.test().join("nushell").to_std_path_buf();
+
+        let () = test()
+            .with_history(&config_home, HistoryFileFormat::Plaintext)
+            .with_history_ignore_patterns(&["^exit$", "(?i)token"])
+            .run("[ls exit 'let TOKEN = 1' pwd] | history import")?;
+
+        let got =
+            query_all(&*open_backend(&config_home, HistoryFileFormat::Plaintext).unwrap()).unwrap();
+
+        assert_eq!(commands_only(&got), vec!["ls", "pwd"]);
+        Ok(())
+    })
+}
+
+#[rstest]
+#[case::plaintext_to_sqlite(HistoryFileFormat::Plaintext, HistoryFileFormat::Sqlite)]
+#[case::sqlite_to_plaintext(HistoryFileFormat::Sqlite, HistoryFileFormat::Plaintext)]
+fn conversion_skips_ignored(
+    #[case] src_format: HistoryFileFormat,
+    #[case] dst_format: HistoryFileFormat,
+) -> Result {
+    Playground::setup("history_import_conversion_skips_ignored", |dirs, _| {
+        let config_home = dirs.test().join("nushell").to_std_path_buf();
+        save_all(
+            &mut *open_backend(&config_home, src_format).unwrap(),
+            ["cd /tmp", "secret-tool lookup", "ls"]
+                .into_iter()
+                .map(|command| HistoryItem {
+                    command_line: command.to_string(),
+                    ..EMPTY_ITEM
+                })
+                .collect(),
+        )
+        .unwrap();
+
+        let () = test()
+            .with_history(&config_home, dst_format)
+            .with_history_ignore_patterns(&["^secret-tool"])
+            .run("history import")?;
+
+        let got = query_all(&*open_backend(&config_home, dst_format).unwrap()).unwrap();
+
+        assert_eq!(commands_only(&got), vec!["cd /tmp", "ls"]);
         Ok(())
     })
 }

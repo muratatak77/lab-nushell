@@ -58,6 +58,7 @@ fn help_lists_all_flags() -> TestResult {
         "--no-newline",
         "--no-config-file",
         "--no-history",
+        "--history-ignore",
         "--no-std-lib",
         "--config",
         "--env-config",
@@ -386,6 +387,89 @@ fn no_history_flag_runs() -> TestResult {
         .output()?;
 
     assert!(output.status.success());
+
+    Ok(())
+}
+
+#[test]
+fn history_ignore_flag_appends_to_config_patterns() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let config = dir.path().join("config.nu");
+    std::fs::write(&config, "$env.config.history.ignore_patterns = ['^ls$']")?;
+
+    let output = Command::new(cargo_bin!())
+        .arg("--config")
+        .arg(&config)
+        .args([
+            "--no-std-lib",
+            "--history-ignore",
+            "^exit$",
+            "--history-ignore",
+            "(?i)token{1,2}, secret",
+            "-c",
+            "$env.config.show_banner = false; $env.config.history.ignore_patterns | to json -r",
+        ])
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        r#"["^ls$","^exit$","(?i)token{1,2}, secret"]"#
+    );
+
+    Ok(())
+}
+
+#[test]
+fn history_ignore_flag_rejects_invalid_regex() -> TestResult {
+    let output = Command::new(cargo_bin!())
+        .args([
+            "--no-config-file",
+            "--history-ignore",
+            "(unclosed",
+            "-c",
+            "print 1",
+        ])
+        .output()?;
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--history-ignore"), "stderr: {stderr}");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).is_empty(),
+        "commands must not run"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn history_ignore_flag_filters_history_import() -> TestResult {
+    let config_home = tempfile::tempdir()?;
+
+    let output = Command::new(cargo_bin!())
+        .arg("--config-home")
+        .arg(config_home.path())
+        .args([
+            "--no-config-file",
+            "--history-ignore",
+            "^exit$",
+            "-c",
+            "[ls exit 'exit 1' pwd] | history import",
+        ])
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let history = std::fs::read_to_string(config_home.path().join("history.txt"))?;
+    assert_eq!(history.lines().collect::<Vec<_>>(), ["ls", "exit 1", "pwd"]);
 
     Ok(())
 }

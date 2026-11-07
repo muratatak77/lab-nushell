@@ -20,6 +20,10 @@ impl Command for History {
         "Get the command history."
     }
 
+    fn extra_description(&self) -> &str {
+        "Commands matching `$env.config.history.ignore_patterns` are never written to the history, so they don't show up here either."
+    }
+
     fn signature(&self) -> nu_protocol::Signature {
         Signature::build("history")
             .input_output_types(vec![(Type::Nothing, Type::Any)])
