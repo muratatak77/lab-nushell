@@ -315,6 +315,24 @@ fn history_import_pipe_skips_ignored() -> Result {
     })
 }
 
+/// Patterns set through `$env.config` earlier in the same block must apply to the import.
+#[test]
+fn history_import_uses_runtime_ignore_patterns() -> Result {
+    Playground::setup("history_import_uses_runtime_ignore_patterns", |dirs, _| {
+        let config_home = dirs.test().join("nushell").to_std_path_buf();
+
+        let () = test()
+            .with_history(&config_home, HistoryFileFormat::Plaintext)
+            .run("$env.config.history.ignore_patterns = ['^ls$']; [ls pwd] | history import")?;
+
+        let got =
+            query_all(&*open_backend(&config_home, HistoryFileFormat::Plaintext).unwrap()).unwrap();
+
+        assert_eq!(commands_only(&got), vec!["pwd"]);
+        Ok(())
+    })
+}
+
 #[rstest]
 #[case::plaintext_to_sqlite(HistoryFileFormat::Plaintext, HistoryFileFormat::Sqlite)]
 #[case::sqlite_to_plaintext(HistoryFileFormat::Sqlite, HistoryFileFormat::Plaintext)]

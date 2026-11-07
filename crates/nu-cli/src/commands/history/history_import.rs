@@ -70,7 +70,7 @@ Commands matching any of the regexes in `$env.config.history.ignore_patterns` ar
     fn run(
         &self,
         engine_state: &EngineState,
-        _stack: &mut Stack,
+        stack: &mut Stack,
         call: &Call,
         input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
@@ -87,7 +87,12 @@ Commands matching any of the regexes in `$env.config.history.ignore_patterns` ar
         if let Some(bak_path) = backup(&current_history_path, span)? {
             println!("Backed history to {}", bak_path.display());
         }
-        let ignore = HistoryIgnore::new(engine_state, &history.ignore_patterns);
+        // `ignore_patterns` may change at runtime, so read them from the stack's config, which
+        // sees `$env.config` updates made earlier in the same script or `-c` block.
+        let ignore = HistoryIgnore::new(
+            engine_state,
+            &stack.get_config(engine_state).history.ignore_patterns,
+        );
         match input {
             PipelineData::Empty => {
                 let other_format = match history.file_format {
