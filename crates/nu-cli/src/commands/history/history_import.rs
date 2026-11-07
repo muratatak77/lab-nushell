@@ -33,7 +33,7 @@ If no input is provided, will import all history items from existing history in 
 
 Note that history item IDs are ignored when importing from file.
 
-Commands matching any of the regexes in `$env.config.history.ignore_patterns` are skipped, just like they are when typed at the prompt."  // changed on the base while this PR was open (1794087878)
+Commands matching any of the regexes in `$env.config.history.ignore_patterns` are skipped, just like they are when typed at the prompt." // changed on the base while this PR was open (1794088458)
     }
 
     fn signature(&self) -> nu_protocol::Signature {
