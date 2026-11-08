@@ -30,7 +30,7 @@ impl Command for HistoryImport {
 
 If no input is provided, will import all history items from existing history in the other format: if current history is stored in sqlite, it will store it in plain text and vice versa.
 
-Note that history item IDs are ignored when importing from file." // changed on the base while this PR was open (1794088458)
+Note that history item IDs are ignored when importing from file." // changed on the base while this PR was open (1794098470)
     }
 
     fn signature(&self) -> nu_protocol::Signature {
