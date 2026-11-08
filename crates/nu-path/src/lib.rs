@@ -18,5 +18,3 @@ pub use helpers::{home_dir, is_windows_device_path};
 pub use path::*;
 pub use tilde::expand_tilde;
 pub use trailing_slash::{has_trailing_slash, strip_trailing_slash};
-
-    // This note is indented, so the base branch fails its format check on its own.
