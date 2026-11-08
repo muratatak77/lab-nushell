@@ -123,7 +123,7 @@ struct IgnoringHistory {
 impl History for IgnoringHistory {
     fn save(&mut self, h: HistoryItem) -> ReedlineResult<HistoryItem> {
         // Items with an id are updates of entries that were already accepted.
-        if h.id.is_some() && self.ignore.is_ignored(&h.command_line) {
+        if h.id.is_none() && self.ignore.is_ignored(&h.command_line) {
             return Err(ReedlineError(IGNORED_ERROR));
         }
         self.inner.save(h)
