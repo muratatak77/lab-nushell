@@ -103,6 +103,10 @@ impl HistoryIgnore {
     }
 }
 
+/// Error returned by [`IgnoringHistory::save`] for entries matching `history.ignore_patterns`.
+const IGNORED_ERROR: ReedlineErrorVariants =
+    ReedlineErrorVariants::OtherHistoryError("entry matches history.ignore_patterns");
+
 /// A [`History`] backend that refuses new entries matched by a [`HistoryIgnore`].
 ///
 /// Refused entries return [`IGNORED_ERROR`]. Reedline treats a failed save as "ran but not
@@ -111,9 +115,6 @@ impl HistoryIgnore {
 /// only updates that in-memory copy, so nothing about the command reaches the backend.
 /// Returning the item without an id instead would make reedline forget the line at once.
 /// Reedline stashes the error for `take_history_save_error`, which nu does not report.
-const IGNORED_ERROR: ReedlineErrorVariants =
-    ReedlineErrorVariants::OtherHistoryError("entry matches history.ignore_patterns");
-
 struct IgnoringHistory {
     inner: Box<dyn History>,
     ignore: HistoryIgnore,
