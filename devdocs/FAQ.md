@@ -42,6 +42,31 @@ reimplementation of the GNU coreutils. These currently include `cp`, `mv`,
 dependencies in the root `Cargo.toml`). Relying on uutils lets these commands
 behave consistently across Windows, macOS, and Linux.
 
+## How do I add a new `$env.config` option?
+
+Config options live as plain Rust structs in `crates/nu-protocol/src/config/`, one module per section
+(e.g. `history.rs` for `$env.config.history`). For a new field:
+
+1. Add the field to the struct and its `Default` impl.
+2. Add it to the struct's `IntoValue` impl, otherwise it won't show up in `$env.config`.
+3. Handle the key in the `UpdateFromValue` impl. Reuse the existing `update` impls for simple types
+    and report problems through `ConfigErrors` (`type_mismatch`, `invalid_value`, ...) instead of
+    returning early, so users see every mistake at once. Validate as much as you can here (e.g.
+    compile regexes), so consumers can trust the stored value.
+4. Decide whether the option may change at runtime. Most can. Options that are only read when
+    something is set up (like the history file location) have to reject later changes, see
+    `history_locked_after_startup` for an example.
+5. Read the option through `engine_state.get_config()` (or `stack.get_config(engine_state)` inside
+    commands) at the point where it is used. Values that need to be compiled should be cached and only
+    rebuilt when the config actually changed; the REPL re-reads the config before every prompt.
+6. Document it in `crates/nu-config/default_files/doc_config.nu`, which is what `config nu --doc`
+    shows.
+7. Test the parsing next to the struct (unit tests), and the user-facing behavior in
+    `tests/repl/test_config.rs`.
+
+If the option also gets a command line flag (like `--table-mode` or `--history-ignore`), parse and
+validate it in `src/command.rs` and apply it in `src/run.rs` after the config files were read.
+
 ## How do I check an environment variable?
 TODO
 

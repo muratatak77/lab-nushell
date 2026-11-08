@@ -357,6 +357,7 @@ reedline = { workspace = true, features = ["bashisms"] }
 crossterm = { workspace = true }
 ctrlc = { workspace = true }
 dirs = { workspace = true }
+fancy-regex = { workspace = true }
 log = { workspace = true }
 lexopt = { workspace = true }
 miette = { workspace = true, features = ["fancy-no-backtrace", "fancy"] }
@@ -397,7 +398,6 @@ nu-test-support = { path = "./crates/nu-test-support", features = ["os", "plugin
 
 assert_cmd = "2.2.2"
 dirs = { workspace = true }
-fancy-regex = { workspace = true }
 itertools = { workspace = true }
 pretty_assertions = { workspace = true }
 rstest = { workspace = true, default-features = false }

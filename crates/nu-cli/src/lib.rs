@@ -7,6 +7,7 @@ mod config_files;
 mod eval_cmds;
 mod eval_file;
 mod hints;
+mod history_ignore;
 mod menus;
 mod prompt;
 mod prompt_update;

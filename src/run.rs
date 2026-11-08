@@ -9,7 +9,7 @@ use nu_cli::{EvaluateCommandsOpts, evaluate_commands, evaluate_file, evaluate_re
 use nu_config::ConfigFileKind;
 use nu_engine::exit::kill_jobs_and_exit;
 use nu_protocol::{
-    PipelineData, ShellError,
+    IntoValue, PipelineData, ShellError, Span, Spanned,
     engine::{EngineState, Stack},
     report_shell_error,
 };
@@ -94,6 +94,12 @@ pub(crate) fn run_commands(
 
         perf!("read login.nu", start_time, use_color);
     }
+
+    apply_history_ignore_flag(
+        engine_state,
+        &mut stack,
+        parsed_nu_cli_args.history_ignore.as_deref(),
+    );
 
     // Startup ends when the commands start running.
     engine_state.finish_startup();
@@ -182,6 +188,12 @@ pub(crate) fn run_file(
         perf!("read config.nu", start_time, use_color);
     }
 
+    apply_history_ignore_flag(
+        engine_state,
+        &mut stack,
+        parsed_nu_cli_args.history_ignore.as_deref(),
+    );
+
     // Startup ends when the script starts running.
     engine_state.finish_startup();
 
@@ -237,6 +249,13 @@ pub(crate) fn run_repl(
         .get(engine_state);
     perf!("setup_config", start_time, use_color);
 
+    // Before the REPL builds the line editor, so the very first command is already filtered.
+    apply_history_ignore_flag(
+        engine_state,
+        &mut stack,
+        parsed_nu_cli_args.history_ignore.as_deref(),
+    );
+
     // Apply --table-mode / -m CLI flag override before starting the REPL
     if let Some(ref t_mode) = parsed_nu_cli_args.table_mode
         && let Ok(s) = t_mode.coerce_str()
@@ -257,6 +276,36 @@ pub(crate) fn run_repl(
     perf!("evaluate_repl", start_time, use_color);
 
     ret_val
+}
+
+/// Append the `--history-ignore` patterns to `$env.config.history.ignore_patterns`.
+///
+/// The patterns are added on top of whatever the config files set. They go through `$env.config`
+/// rather than only [`EngineState::set_config`], so they show up when reading `$env.config` and
+/// survive later assignments to other config options.
+fn apply_history_ignore_flag(
+    engine_state: &mut EngineState,
+    stack: &mut Stack,
+    patterns: Option<&[Spanned<String>]>,
+) {
+    let Some(patterns) = patterns.filter(|patterns| !patterns.is_empty()) else {
+        return;
+    };
+
+    let mut config = stack.get_config(engine_state).as_ref().clone();
+    config
+        .history
+        .ignore_patterns
+        .extend(patterns.iter().map(|pattern| pattern.item.clone()));
+    // No source span — the patterns come from the command line
+    stack.add_env_var("config".into(), config.into_value(Span::unknown()));
+
+    let result = stack
+        .update_config(engine_state)
+        .and_then(|()| engine_state.merge_env(stack));
+    if let Err(err) = result {
+        report_shell_error(Some(stack), engine_state, &err);
+    }
 }
 
 #[cfg(feature = "lsp")]

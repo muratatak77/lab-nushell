@@ -266,6 +266,14 @@ const CLI_FLAGS: &[CliFlag] = &[
         CliCategory::Config,
         "nu --no-history",
     ),
+    CliFlag::value(
+        "history-ignore",
+        None,
+        ValueHint::String,
+        "don't save commands matching this regex to history (can be repeated)",
+        CliCategory::Config,
+        "nu --history-ignore '^exit$' --history-ignore '(?i)token'",
+    ),
     CliFlag::switch(
         "no-std-lib",
         None,
@@ -493,6 +501,7 @@ struct CliValues {
     plugins: Option<Vec<Spanned<String>>>,
     no_config_file: Option<Spanned<String>>,
     no_history: Option<Spanned<String>>,
+    history_ignore: Option<Vec<Spanned<String>>>,
     no_std_lib: Option<Spanned<String>>,
     config_file: Option<Spanned<String>>,
     env_file: Option<Spanned<String>>,
@@ -745,6 +754,12 @@ fn parse_cli_args_with_command_line(
             Long("no-newline") => cli.no_newline = Some(spanned_true()),
             Short('n') | Long("no-config-file") => cli.no_config_file = Some(spanned_true()),
             Long("no-history") => cli.no_history = Some(spanned_true()),
+            Long("history-ignore") => {
+                let value = parse_history_ignore_pattern(&mut parser)?;
+                cli.history_ignore
+                    .get_or_insert_with(Vec::new)
+                    .push(spanned_value(value));
+            }
             Long("no-std-lib") => cli.no_std_lib = Some(spanned_true()),
             Long("config") => {
                 let value = parse_string_value(&mut parser, "config")?;
@@ -938,6 +953,7 @@ fn parse_cli_args_with_command_line(
             plugins: cli.plugins,
             no_config_file: cli.no_config_file,
             no_history: cli.no_history,
+            history_ignore: cli.history_ignore,
             no_std_lib: cli.no_std_lib,
             config_file: cli.config_file,
             env_file: cli.env_file,
@@ -1116,6 +1132,24 @@ fn parse_string_value(parser: &mut lexopt::Parser, name: &str) -> Result<String,
             )
             .with_help("Use UTF-8 values when calling nushell.")
         })
+}
+
+/// Parse the value of `--history-ignore`, rejecting patterns that are not valid regexes.
+///
+/// Each occurrence of the flag holds exactly one pattern: regexes routinely contain commas and
+/// spaces, so the list splitting used by other multi-value flags would break them apart.
+fn parse_history_ignore_pattern(parser: &mut lexopt::Parser) -> Result<String, CliError> {
+    let value = parse_string_value(parser, "history-ignore")?;
+    if let Err(err) = fancy_regex::Regex::new(&value) {
+        return Err(CliError::new(
+            "Invalid value for `--history-ignore`",
+            "invalid regular expression",
+        )
+        .with_help(format!(
+            "`{value}` is not a valid regular expression: {err}"
+        )));
+    }
+    Ok(value)
 }
 
 // Parse and validate a string value against a list of allowed values.
@@ -1575,6 +1609,7 @@ fn prevalidate_short_groups_before_lexopt(args: &[OsString]) -> Result<(), CliEr
             || arg == "-m"
             || arg == "--table-mode"
             || arg == "--error-style"
+            || arg == "--history-ignore"
             || arg == "--ide-check"
             || arg == "--ide-goto-def"
             || arg == "--ide-hover"
@@ -1792,6 +1827,7 @@ pub(crate) struct NushellCliArgs {
     pub(crate) plugins: Option<Vec<Spanned<String>>>,
     pub(crate) no_config_file: Option<Spanned<String>>,
     pub(crate) no_history: Option<Spanned<String>>,
+    pub(crate) history_ignore: Option<Vec<Spanned<String>>>,
     pub(crate) no_std_lib: Option<Spanned<String>>,
     pub(crate) config_file: Option<Spanned<String>>,
     pub(crate) env_file: Option<Spanned<String>>,
@@ -2060,6 +2096,42 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["error", "warn"]
         );
+    }
+
+    #[test]
+    fn history_ignore_accumulates_patterns_verbatim() {
+        let args = vec![
+            OsString::from("nu"),
+            OsString::from("--history-ignore"),
+            OsString::from("^(ls|cd)$"),
+            OsString::from("--history-ignore=secret, token{1,2}"),
+            OsString::from("script.nu"),
+        ];
+
+        let parsed = parse_cli_args(args).expect("should parse args");
+        assert_eq!(
+            parsed
+                .nu
+                .history_ignore
+                .expect("history ignore patterns")
+                .into_iter()
+                .map(|v| v.item)
+                .collect::<Vec<_>>(),
+            vec!["^(ls|cd)$", "secret, token{1,2}"]
+        );
+        assert_eq!(parsed.script_name, "script.nu");
+    }
+
+    #[test]
+    fn history_ignore_rejects_invalid_regex() {
+        let args = vec![
+            OsString::from("nu"),
+            OsString::from("--history-ignore"),
+            OsString::from("(unclosed"),
+        ];
+
+        let err = parse_cli_args(args).expect_err("invalid regex should be rejected");
+        assert!(err.to_string().contains("--history-ignore"));
     }
 
     #[test]

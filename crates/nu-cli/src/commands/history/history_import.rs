@@ -11,6 +11,7 @@ use reedline::{
 };
 
 use super::fields;
+use crate::history_ignore::HistoryIgnore;
 
 #[derive(Clone)]
 pub struct HistoryImport;
@@ -30,7 +31,9 @@ impl Command for HistoryImport {
 
 If no input is provided, will import all history items from existing history in the other format: if current history is stored in sqlite, it will store it in plain text and vice versa.
 
-Note that history item IDs are ignored when importing from file." // changed on the base while this PR was open (1794098470)
+Note that history item IDs are ignored when importing from file.
+
+Commands matching any of the regexes in `$env.config.history.ignore_patterns` are skipped, just like they are when typed at the prompt." // changed on the base while this PR was open (1794098470)
     }
 
     fn signature(&self) -> nu_protocol::Signature {
@@ -67,7 +70,7 @@ Note that history item IDs are ignored when importing from file." // changed on 
     fn run(
         &self,
         engine_state: &EngineState,
-        _stack: &mut Stack,
+        stack: &mut Stack,
         call: &Call,
         input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
@@ -84,6 +87,12 @@ Note that history item IDs are ignored when importing from file." // changed on 
         if let Some(bak_path) = backup(&current_history_path, span)? {
             println!("Backed history to {}", bak_path.display());
         }
+        // `ignore_patterns` may change at runtime, so read them from the stack's config, which
+        // sees `$env.config` updates made earlier in the same script or `-c` block.
+        let ignore = HistoryIgnore::new(
+            engine_state,
+            &stack.get_config(engine_state).history.ignore_patterns,
+        );
         match input {
             PipelineData::Empty => {
                 let other_format = match history.file_format {
@@ -110,7 +119,7 @@ Note that history item IDs are ignored when importing from file." // changed on 
                     .map_err(error_from_reedline)?
                     .into_iter()
                     .map(Ok);
-                import(dst.as_mut(), items)
+                import(dst.as_mut(), items, &ignore)
             }
             _ => {
                 let input = input.into_iter().map(item_from_value);
@@ -123,6 +132,7 @@ Note that history item IDs are ignored when importing from file." // changed on 
                     )?
                     .as_mut(),
                     input,
+                    &ignore,
                 )
             }
         }?;
@@ -163,12 +173,17 @@ fn new_backend(
     }
 }
 
+/// Save every item of `src` to `dst` as a new entry, skipping those matched by `ignore`.
 fn import(
     dst: &mut dyn History,
     src: impl Iterator<Item = Result<HistoryItem, ShellError>>,
+    ignore: &HistoryIgnore,
 ) -> Result<(), ShellError> {
     for item in src {
         let mut item = item?;
+        if ignore.is_ignored(&item.command_line) {
+            continue;
+        }
         item.id = None;
         dst.save(item).map_err(error_from_reedline)?;
     }
